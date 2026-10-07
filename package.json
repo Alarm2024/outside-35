@@ -9,7 +9,8 @@
     "test": "node --test \"test/*.test.mjs\"",
     "build": "node scripts/build.mjs",
     "smoke": "node scripts/smoke.mjs",
-    "model-check": "node scripts/model-check.mjs"
+    "model-check": "node scripts/model-check.mjs",
+    "probe-ort": "node scripts/probe-ort.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "4.3.1"

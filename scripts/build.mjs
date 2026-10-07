@@ -4,14 +4,13 @@
 import { build } from 'esbuild';
 import { cp, mkdir, rm, readFile, writeFile, readdir } from 'node:fs/promises';
 import { execSync } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { ortPackage } from './pkg.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const src = path.join(root, 'src');
 const dist = path.join(root, 'dist');
-const require = createRequire(import.meta.url);
 
 function version() {
   if (process.env.GITHUB_SHA) return process.env.GITHUB_SHA.slice(0, 12);
@@ -26,7 +25,8 @@ await rm(dist, { recursive: true, force: true });
 await mkdir(path.join(dist, 'vendor', 'ort'), { recursive: true });
 
 await build({
-  entryPoints: [path.join(src, 'app.js')],
+  // The model runs in its own worker (model-worker.js), off the page's main thread.
+  entryPoints: [path.join(src, 'app.js'), path.join(src, 'model-worker.js')],
   bundle: true,
   format: 'esm',
   splitting: true,
@@ -44,28 +44,20 @@ for (const f of ['index.html', 'styles.css', 'manifest.webmanifest']) {
   await cp(path.join(src, f), path.join(dist, f));
 }
 await cp(path.join(src, 'icons'), path.join(dist, 'icons'), { recursive: true });
+// Two ~1 KB graphs with the model's quantized operators: the worker runs them
+// before the 344 MB download, so a browser that cannot run Gemma says so first.
+await mkdir(path.join(dist, 'ort-check'), { recursive: true });
+for (const f of ['gather_block_quantized.onnx', 'matmul_nbits.onnx']) {
+  await cp(path.join(root, 'test', 'fixtures', 'ort', f), path.join(dist, 'ort-check', f));
+}
 await cp(path.join(root, 'LICENSE'), path.join(dist, 'LICENSE.txt'));
 await writeFile(path.join(dist, '.nojekyll'), '');
 
-// Packages that do not export package.json: walk up from their entry file.
-async function pkgDir(req, name) {
-  let dir = path.dirname(req.resolve(name));
-  for (;;) {
-    try {
-      const pkg = JSON.parse(await readFile(path.join(dir, 'package.json'), 'utf8'));
-      if (pkg.name === name) return { dir, version: pkg.version };
-    } catch { /* keep walking */ }
-    const up = path.dirname(dir);
-    if (up === dir) throw new Error(`cannot find package.json for ${name}`);
-    dir = up;
-  }
-}
-
 // ONNX Runtime Web, the exact version Transformers.js depends on.
-const tjs = await pkgDir(require, '@huggingface/transformers');
-const ort = await pkgDir(createRequire(path.join(tjs.dir, 'package.json')), 'onnxruntime-web');
+const { tjs, ort } = await ortPackage(import.meta.url);
 const ortVersion = ort.version;
 const ortDist = path.join(ort.dir, 'dist');
+// asyncify: WebGPU. Plain: the CPU (see scripts/probe-ort.mjs for why both).
 const ortFiles = ['ort-wasm-simd-threaded.asyncify.mjs', 'ort-wasm-simd-threaded.asyncify.wasm', 'ort-wasm-simd-threaded.mjs', 'ort-wasm-simd-threaded.wasm'];
 for (const f of ortFiles) await cp(path.join(ortDist, f), path.join(dist, 'vendor', 'ort', f));
 

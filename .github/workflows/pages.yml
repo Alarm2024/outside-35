@@ -32,6 +32,8 @@ jobs:
         run: npx playwright-core install --with-deps chromium
       - name: Browser smoke test (UNKNOWN states, offline, no tracking)
         run: npm run smoke
+      - name: The shipped runtime runs the model's q4 operators (CPU and WebGPU)
+        run: npm run probe-ort
       - uses: actions/upload-pages-artifact@v4
         if: github.event_name != 'pull_request'
         with:
