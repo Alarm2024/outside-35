@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+.hf-cache/
+model-check.md
+docs/screenshot-model.png

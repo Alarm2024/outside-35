@@ -1,0 +1,53 @@
+name: Model check
+
+# Loads the real Gemma 3 270M IT (q4) with the app's own prompt builder and
+# never-guess check, and writes what it answered to the job summary.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/lib/plan.js'
+      - 'src/lib/guard.js'
+      - 'src/lib/model-info.js'
+      - 'scripts/model-check.mjs'
+      - 'package-lock.json'
+      - '.github/workflows/model-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gemma:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      # With scripts: onnxruntime-node fetches its native binary here.
+      - run: npm ci
+      - uses: actions/cache@v4
+        with:
+          path: .hf-cache
+          key: hf-gemma-3-270m-it-q4-v1
+      - name: Gemma in Node (same prompt and check as the app)
+        run: npm run model-check
+      - name: Build the site
+        run: npm run build
+      - name: Install Chromium
+        run: npx playwright-core install --with-deps chromium
+      - name: Gemma in the browser, then again with no signal
+        env:
+          MODEL: '1'
+        run: npm run smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: model-check
+          path: |
+            model-check.md
+            docs/screenshot-model.png
+          if-no-files-found: ignore

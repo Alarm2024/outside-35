@@ -1,0 +1,21 @@
+{
+  "name": "outside-35",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Outside 35 by elghaly: a tiny offline-first web app that gets you outdoors, with an open-weight model running in your browser.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "build": "node scripts/build.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "model-check": "node scripts/model-check.mjs"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10",
+    "playwright-core": "1.56.1"
+  }
+}
