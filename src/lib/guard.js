@@ -1,21 +1,38 @@
 // The never-guess check for model output. The model may write words; it may
 // not invent facts. Anything that fails is discarded, and the app says so.
 
+import { normItem } from './plan.js';
+
 const LINE = /^\s*[*_#>\-\s]*\b(bring|notice)\b\s*[*_]*\s*[:\-–]\s*(.+)$/i;
 const DIGIT = /[0-9٠-٩۰-۹]/u;
 const URL = /https?:|www\./i;
-const ITEM_OK = /^[\p{L}\p{M}' &/-]{2,40}$/u;
-const WEATHER_CLAIM =
-  /\b(will|going to|expect(ed)?|forecast)\b[^.]*\b(rain|shower|snow|storm|thunder|sun|sunny|cloud|clouds|wind|windy|hot|cold|warm|clear)\b/i;
+// Echoes of the prompt, not an answer.
+const ECHO = /\b(sentence|format|thing, thing|this list)\b/i;
+
+// A weather word in NOTICE is a claim about the weather. It is allowed only
+// when the condition words given to the model say the same thing.
+const CLAIMS = [
+  { re: /\b(rain\w*|drizzl\w*|showers?|puddles?|umbrellas?)\b/i, ok: (w) => /rain|thunder/.test(w.rain) },
+  { re: /\b(thunder\w*|lightning|storm\w*)\b/i, ok: (w) => w.rain === 'thunderstorms possible' },
+  { re: /\b(snow\w*|frost\w*|ice|icy|freez\w*)\b/i, ok: (w) => w.temp === 'freezing' },
+  { re: /\b(wind\w*|breez\w*|gust\w*)\b/i, ok: (w) => w.wind === 'windy' || w.wind === 'breezy' },
+  { re: /\b(sunny|sunshine|sun is shining|bright sun)\b/i, ok: (w) => w.sun === 'strong sun' || w.sun === 'some sun' },
+  { re: /\b(hot|heat|warm\w*)\b/i, ok: (w) => w.temp === 'warm' || w.temp === 'hot' },
+  { re: /\b(cold|chilly|cool|crisp)\b/i, ok: (w) => ['cold', 'cool', 'freezing'].includes(w.temp) },
+  // Cloud cover, fog and humidity are never given to the model.
+  { re: /\b(cloudy|overcast|grey sky|gray sky|fog\w*|mist|misty|humid\w*|forecast)\b/i, ok: () => false },
+];
 
 const clean = (s) => s.replace(/[*_`]/g, '').trim();
 
 /**
  * @param {string} text raw model output
- * @param {{ weatherKnown: boolean }} ctx
- * @returns {{ ok: true, bring: string[], notice: string } | { ok: false, reason: string }}
+ * @param {{ words: object|null, options: string[] }} ctx
+ *   words: the condition words the model was given (null = weather UNKNOWN)
+ *   options: the list the model was asked to pick from
+ * @returns {{ ok: true, picks: string[], dropped: string[], notice: string } | { ok: false, reason: string }}
  */
-export function checkModelOutput(text, { weatherKnown }) {
+export function checkModelOutput(text, { words, options }) {
   if (typeof text !== 'string' || !text.trim()) return { ok: false, reason: 'the model returned nothing' };
 
   let bringRaw = null;
@@ -34,19 +51,35 @@ export function checkModelOutput(text, { weatherKnown }) {
   const both = `${bringRaw}\n${notice}`;
   if (DIGIT.test(both)) return { ok: false, reason: 'it contained a number, and numbers must come from data' };
   if (URL.test(both)) return { ok: false, reason: 'it contained a link' };
-  if (!weatherKnown && WEATHER_CLAIM.test(both)) {
-    return { ok: false, reason: 'it predicted the weather without any weather data' };
+
+  // BRING: only things from the list. Anything else is dropped, and at least
+  // two real picks must remain.
+  const byNorm = new Map(options.map((o) => [normItem(o), o]));
+  const picks = [];
+  const dropped = [];
+  for (const part of bringRaw.split(/\s*[,;]\s*|\s+and\s+/i)) {
+    const n = normItem(part);
+    if (!n) continue;
+    const hit = byNorm.get(n) ?? byNorm.get(n.replace(/s$/, '')) ?? byNorm.get(`${n}s`);
+    if (hit && !picks.includes(hit)) picks.push(hit);
+    else if (!hit) dropped.push(part.trim());
   }
+  if (picks.length < 2) return { ok: false, reason: 'BRING did not pick at least two things from the list it was given' };
 
-  const bring = bringRaw
-    .replace(/\.$/, '')
-    .split(/\s*[,;]\s*|\s+and\s+/i)
-    .map((s) => s.trim().replace(/^(a|an|some)\s+(?=\S)/i, (m) => m.toLowerCase()))
-    .filter(Boolean);
-  if (bring.length < 1 || bring.length > 5) return { ok: false, reason: 'BRING should list one to five things' };
-  const bad = bring.find((item) => !ITEM_OK.test(item));
-  if (bad) return { ok: false, reason: `"${bad.slice(0, 40)}" is not a short list item` };
-
-  if (notice.length < 8 || notice.length > 200) return { ok: false, reason: 'NOTICE should be one short sentence' };
-  return { ok: true, bring, notice };
+  // NOTICE: one plain sentence, no weather it was not given.
+  const wordCount = notice.split(/\s+/).filter(Boolean).length;
+  if (wordCount < 4 || notice.length > 160) return { ok: false, reason: 'NOTICE should be one short sentence' };
+  if (ECHO.test(notice)) return { ok: false, reason: 'NOTICE repeated the instructions instead of answering' };
+  for (const c of CLAIMS) {
+    const m = notice.match(c.re);
+    if (m && !(words && c.ok(words))) {
+      return {
+        ok: false,
+        reason: words
+          ? `NOTICE says "${m[0]}", which the forecast it was given does not say`
+          : `NOTICE says "${m[0]}" with no weather data`,
+      };
+    }
+  }
+  return { ok: true, picks: picks.slice(0, 3), dropped, notice };
 }

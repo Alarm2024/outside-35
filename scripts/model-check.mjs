@@ -7,8 +7,8 @@
 // Exit code 1 if the model cannot load, or if every answer fails the check.
 import { pipeline, env } from '@huggingface/transformers';
 import { appendFile, writeFile } from 'node:fs/promises';
-import { MODEL } from '../src/lib/model-info.js';
-import { buildPrompt, conditionWords } from '../src/lib/plan.js';
+import { MODEL, GENERATION } from '../src/lib/model-info.js';
+import { buildPrompt, bringOptions, conditionWords, requiredLabel } from '../src/lib/plan.js';
 import { checkModelOutput } from '../src/lib/guard.js';
 
 const scenarios = [
@@ -34,13 +34,14 @@ const loadSecs = ((Date.now() - t0) / 1000).toFixed(1);
 const rows = [];
 for (const s of scenarios) {
   const words = conditionWords(s.facts);
-  const prompt = buildPrompt({ activity: s.activity, words, seasonName: s.seasonName, part: s.part });
+  const options = bringOptions(s.activity, words);
+  const prompt = buildPrompt({ activity: s.activity, words, seasonName: s.seasonName, part: s.part, options });
   const t = Date.now();
-  // Same generation settings as src/model.js.
-  const out = await generator([{ role: 'user', content: prompt }], { max_new_tokens: 64, do_sample: false, repetition_penalty: 1.1 });
+  const out = await generator([{ role: 'user', content: prompt }], GENERATION);
   const raw = String(out?.[0]?.generated_text?.at(-1)?.content ?? '');
-  const check = checkModelOutput(raw, { weatherKnown: Boolean(words) });
-  rows.push({ s, words, raw, check, secs: ((Date.now() - t) / 1000).toFixed(1) });
+  const check = checkModelOutput(raw, { words, options: options.optional });
+  const shown = check.ok ? [...options.required.map(requiredLabel), ...check.picks].join(', ') : '';
+  rows.push({ s, words, raw, check, shown, secs: ((Date.now() - t) / 1000).toFixed(1) });
 }
 
 const accepted = rows.filter((r) => r.check.ok).length;
@@ -50,9 +51,9 @@ const md = [
   '',
   `Loaded in ${loadSecs} s on the CI runner's CPU. ${accepted} of ${rows.length} answers passed the never-guess check.`,
   '',
-  '| plan | weather words given | model answer | check |',
-  '|---|---|---|---|',
-  ...rows.map((r) => `| ${r.s.activity} | ${r.words ? esc(Object.values(r.words).join(', ')) : 'none (weather UNKNOWN)'} | ${esc(r.raw)} | ${r.check.ok ? 'used' : `discarded: ${esc(r.check.reason)}`} (${r.secs} s) |`),
+  '| plan | weather words given | model answer | check | bring shown |',
+  '|---|---|---|---|---|',
+  ...rows.map((r) => `| ${r.s.activity} | ${r.words ? esc(Object.values(r.words).join(', ')) : 'none (weather UNKNOWN)'} | ${esc(r.raw)} | ${r.check.ok ? `used${r.check.dropped.length ? `, dropped ${esc(r.check.dropped.join(', '))}` : ''}` : `discarded: ${esc(r.check.reason)}`} (${r.secs} s) | ${esc(r.shown || 'built-in text')} |`),
   '',
 ].join('\n');
 

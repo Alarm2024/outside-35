@@ -1,15 +1,36 @@
 name: Model check
 
 # Loads the real Gemma 3 270M IT (q4) with the app's own prompt builder and
-# never-guess check, and writes what it answered to the job summary.
+# never-guess check, and writes what it answered to the job summary: in Node,
+# then in headless Chromium on the CPU and on WebGPU, then again with no signal.
 on:
   push:
     branches: [main]
     paths:
+      - 'src/model.js'
+      - 'src/app.js'
       - 'src/lib/plan.js'
       - 'src/lib/guard.js'
       - 'src/lib/model-info.js'
       - 'scripts/model-check.mjs'
+      - 'scripts/smoke.mjs'
+      - 'scripts/build.mjs'
+      - 'scripts/probe-ort.mjs'
+      - 'test/fixtures/ort/**'
+      - 'package-lock.json'
+      - '.github/workflows/model-check.yml'
+  pull_request:
+    paths:
+      - 'src/model.js'
+      - 'src/app.js'
+      - 'src/lib/plan.js'
+      - 'src/lib/guard.js'
+      - 'src/lib/model-info.js'
+      - 'scripts/model-check.mjs'
+      - 'scripts/smoke.mjs'
+      - 'scripts/build.mjs'
+      - 'scripts/probe-ort.mjs'
+      - 'test/fixtures/ort/**'
       - 'package-lock.json'
       - '.github/workflows/model-check.yml'
   workflow_dispatch:
@@ -17,10 +38,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: model-check-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   gemma:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -39,9 +64,18 @@ jobs:
         run: npm run build
       - name: Install Chromium
         run: npx playwright-core install --with-deps chromium
-      - name: Gemma in the browser, then again with no signal
+      - name: Which runtime build runs the q4 operators (CPU and WebGPU)
+        run: npm run probe-ort
+      - name: Gemma in the browser on the CPU, then again with no signal
+        timeout-minutes: 15
         env:
           MODEL: '1'
+        run: npm run smoke
+      - name: Gemma in the browser on WebGPU (software GPU), then again with no signal
+        timeout-minutes: 20
+        env:
+          MODEL: '1'
+          MODEL_DEVICE: webgpu
         run: npm run smoke
       - uses: actions/upload-artifact@v4
         if: always()
@@ -49,5 +83,5 @@ jobs:
           name: model-check
           path: |
             model-check.md
-            docs/screenshot-model.png
+            docs/screenshot-model-*.png
           if-no-files-found: ignore

@@ -1,10 +1,10 @@
 // Browser smoke test of the built site (dist/) in headless Chromium.
 // Checks the never-guess behaviour end to end, offline mode, and that the page
-// talks to nobody except Open-Meteo (only when asked). The model itself is
-// exercised by scripts/model-check.mjs; downloading 344 MB here would test the
-// network, not the app.
+// talks to nobody except Open-Meteo (only when asked).
 //
 //   npm run build && npm run smoke            # SCREENSHOT=1 also writes docs/screenshot.png
+//   MODEL=1 npm run smoke                     # + the real model on the CPU (344 MB download)
+//   MODEL=1 MODEL_DEVICE=webgpu npm run smoke # + the real model on WebGPU (SwiftShader, no GPU needed)
 import { chromium } from 'playwright-core';
 import http from 'node:http';
 import { readFile, stat, mkdir } from 'node:fs/promises';
@@ -31,7 +31,12 @@ const server = http.createServer(async (req, res) => {
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://localhost:${server.address().port}/`;
 
-const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined });
+const device = process.env.MODEL ? (process.env.MODEL_DEVICE === 'webgpu' ? 'webgpu' : 'wasm') : null;
+const browser = await chromium.launch({
+  executablePath: process.env.CHROMIUM_PATH || undefined,
+  // A software WebGPU adapter, so the WebGPU path runs without a GPU.
+  args: device === 'webgpu' ? ['--enable-unsafe-webgpu', '--use-webgpu-adapter=swiftshader', '--enable-features=Vulkan'] : [],
+});
 const context = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, locale: 'en-GB', timezoneId: 'Europe/London' });
 const page = await context.newPage();
 const external = [];
@@ -73,7 +78,8 @@ await context.route('https://api.open-meteo.com/**', async (route) => {
   await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(fixtureForecast()) });
 });
 
-await page.goto(base);
+// ?device= pins the model to one backend, so each run tests the path it names.
+await page.goto(device ? `${base}?device=${device}` : base);
 
 await step('loads with Walk selected and everything UNKNOWN', async () => {
   assert.match(await page.title(), /Outside 35/);
@@ -151,6 +157,7 @@ await step('no page errors', async () => {
 
 if (process.env.MODEL) {
   // The real model, in this browser: about 344 MB from the Hugging Face Hub.
+  const where = device === 'webgpu' ? /WebGPU/ : /CPU \(WebAssembly\)/;
   const summary = [];
   const waitText = (sel, re, ms) => page.waitForFunction(
     ([s, src]) => new RegExp(src).test(document.querySelector(s).textContent), [sel, re.source], { timeout: ms },
@@ -162,17 +169,18 @@ if (process.env.MODEL) {
     await waitText('#model-v', /ready|could not load/, 20 * 60000);
     const mv = await page.textContent('#model-v');
     assert.match(mv, /ready/, mv);
+    assert.match(mv, where, mv);
     summary.push(`Loaded in the browser in ${((Date.now() - t) / 1000).toFixed(0)} s: ${mv}`);
   });
 
   const writePlan = async (label) => {
     await page.click('#btn-plan');
-    await waitText('#o-source', /written by|was not used|failed/, 10 * 60000);
+    await waitText('#o-source', /picked what to bring|was not used|failed/, 10 * 60000);
     const source = await page.textContent('#o-source');
     const raw = await page.textContent('#o-raw');
     summary.push(`${label}: ${source}`, `  raw answer: ${JSON.stringify(raw)}`,
       `  bring: ${await page.textContent('#o-bring')}`, `  notice: ${await page.textContent('#o-notice')}`);
-    assert.match(source, /written by|was not used/, source);
+    assert.match(source, /picked what to bring|was not used/, source);
     assert.ok(raw.trim().length > 0, 'the model answered');
   };
 
@@ -180,7 +188,7 @@ if (process.env.MODEL) {
     await writePlan('Online');
     await mkdir(path.join(root, 'docs'), { recursive: true });
     await page.evaluate(() => window.scrollTo(0, 0));
-    await page.screenshot({ path: path.join(root, 'docs', 'screenshot-model.png'), fullPage: true });
+    await page.screenshot({ path: path.join(root, 'docs', `screenshot-model-${device}.png`), fullPage: true });
   });
 
   await step('real model: loads again with no signal, from the browser cache', async () => {
@@ -195,7 +203,8 @@ if (process.env.MODEL) {
     await context.setOffline(false);
   });
 
-  const text = ['', '## Gemma in the browser (headless Chromium)', '', '```', ...summary, '```', ''].join('\n');
+  const title = device === 'webgpu' ? 'WebGPU (SwiftShader, a software GPU: slow, but the same code path)' : 'the CPU (WebAssembly)';
+  const text = ['', `## Gemma in headless Chromium, on ${title}`, '', '```', ...summary, '```', ''].join('\n');
   console.log(text);
   if (process.env.GITHUB_STEP_SUMMARY) {
     const { appendFile } = await import('node:fs/promises');

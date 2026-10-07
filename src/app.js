@@ -1,7 +1,7 @@
 import { ACTIVITIES, pickWindow } from './lib/window.js';
 import { daylightWindows, sunTimes } from './lib/sun.js';
 import { fetchForecast, weatherState, forecastToJSON, forecastFromJSON, round2, WEATHER_SOURCE } from './lib/weather.js';
-import { conditionWords, season, timeOfDay, buildPrompt, fallbackBring, fallbackNotice } from './lib/plan.js';
+import { conditionWords, season, timeOfDay, buildPrompt, bringOptions, requiredLabel, fallbackBring, fallbackNotice } from './lib/plan.js';
 import { checkModelOutput } from './lib/guard.js';
 import { rangeLabel, hhmmUTC, localTime, deviceZone } from './lib/format.js';
 import { MODEL } from './lib/model-info.js';
@@ -204,6 +204,15 @@ async function loadModel() {
     state.model = { status: 'ready', device, error: null, progress: 100 };
   } catch (err) {
     console.error(err);
+    if (err.useCpu) {
+      // This page's runtime is set up for WebGPU; the CPU build needs a fresh page.
+      // The weights are already cached, so this costs no second download.
+      state.model = { status: 'loading', device: null, error: null, progress: 100 };
+      $('model-v').replaceChildren(`${MODEL.name}: WebGPU did not work on this device, switching to the CPU…`);
+      store.set('autoload', true);
+      location.reload();
+      return;
+    }
     const reason = navigator.onLine ? (err && err.message ? err.message.slice(0, 120) : 'unknown error') : 'no signal, and it is not saved on this device yet';
     state.model = { status: 'error', device: null, error: reason, progress: 0 };
   }
@@ -275,7 +284,8 @@ async function makePlan() {
   const words = win.status === 'OK' && win.basis === 'sun+weather' ? conditionWords(win.facts) : null;
   const seasonName = loc ? season(now, loc.lat) : 'unknown';
   const part = win.status === 'OK' && sun ? timeOfDay(win.start, sun.solarNoon) : 'unknown';
-  const prompt = buildPrompt({ activity: state.activity, words, seasonName, part });
+  const options = bringOptions(state.activity, words);
+  const prompt = buildPrompt({ activity: state.activity, words, seasonName, part, options });
 
   $('out').hidden = false;
   renderTime(win, now, sun && !sun.polar ? sun : null);
@@ -294,11 +304,12 @@ async function makePlan() {
       const secs = ((performance.now() - t0) / 1000).toFixed(1);
       $('o-raw').textContent = raw;
       $('o-raw-wrap').hidden = false;
-      const check = checkModelOutput(raw, { weatherKnown: Boolean(words) });
+      const check = checkModelOutput(raw, { words, options: options.optional });
       if (check.ok) {
-        bring = check.bring;
+        bring = [...options.required.map(requiredLabel), ...check.picks];
         notice = check.notice;
-        source = `Bring and Notice were written by ${MODEL.name} on your device in ${secs} s, then checked: no numbers, no weather it was not given.`;
+        source = `${MODEL.name} picked what to bring from a fixed list and wrote Notice, on your device in ${secs} s. Then code checked it: no numbers, no weather it was not given.`;
+        if (check.dropped.length) source += ` Left out because they were not on the list: ${check.dropped.slice(0, 3).map((d) => d.slice(0, 40)).join(', ')}.`;
       } else {
         source = `${MODEL.name}'s answer was not used because ${check.reason}. Showing the built-in text instead.`;
       }
@@ -331,12 +342,18 @@ window.addEventListener('online', renderWeather);
 window.addEventListener('offline', renderWeather);
 
 renderAll();
-modelIsCached().then((cached) => {
-  if (cached && state.model.status === 'idle') {
-    state.model.status = 'cached';
-    renderModel();
-  }
-});
+if (store.get('autoload')) {
+  // Back from the switch to the CPU (see loadModel).
+  store.set('autoload', null);
+  loadModel();
+} else {
+  modelIsCached().then((cached) => {
+    if (cached && state.model.status === 'idle') {
+      state.model.status = 'cached';
+      renderModel();
+    }
+  });
+}
 
 const secure = location.protocol === 'https:' || ['localhost', '127.0.0.1'].includes(location.hostname);
 if ('serviceWorker' in navigator && secure) {

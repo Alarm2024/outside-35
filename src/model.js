@@ -3,28 +3,28 @@
 // then stay in this browser's Cache Storage, so it keeps working with no signal.
 
 import { pipeline, env } from '@huggingface/transformers';
-import { MODEL } from './lib/model-info.js';
+import { MODEL, GENERATION } from './lib/model-info.js';
 
 env.allowLocalModels = false; // weights come from the Hub, then from the local cache
 env.useBrowserCache = true;
 // The service worker already keeps vendor/ort offline; do not store it twice.
 env.useWasmCache = false;
 
-function isOldSafari() {
-  const ua = navigator.userAgent;
-  if (!/Safari\//.test(ua) || /Chrome|Chromium|CriOS|Android|Edg/.test(ua)) return false;
-  const m = ua.match(/Version\/(\d+)/);
-  return m ? Number(m[1]) < 26 : false;
-}
+// Which ONNX Runtime build runs the model. Measured, not assumed
+// (scripts/probe-ort.mjs): the q4 weights use GatherBlockQuantized, which the
+// "asyncify" build runs only on WebGPU, and the plain build runs on the CPU.
+// The plain build has no WebGPU, so the choice is made once, before loading.
+const BUILD = { webgpu: '.asyncify', wasm: '' };
 
-// ONNX Runtime's WASM files ship with this site (vendor/ort), not a CDN.
-function useLocalRuntime(webgpu) {
+// Set when WebGPU failed on this device, so the next load goes straight to the CPU.
+const CPU_ONLY_KEY = 'o35:cpu-only';
+
+function useLocalRuntime(device) {
   // Resolved from the page, not this file: after bundling, this code lives in chunks/.
   const base = new URL('vendor/ort/', document.baseURI).href;
-  const suffix = isOldSafari() && !webgpu ? '' : '.asyncify';
   env.backends.onnx.wasm.wasmPaths = {
-    mjs: `${base}ort-wasm-simd-threaded${suffix}.mjs`,
-    wasm: `${base}ort-wasm-simd-threaded${suffix}.wasm`,
+    mjs: `${base}ort-wasm-simd-threaded${BUILD[device]}.mjs`,
+    wasm: `${base}ort-wasm-simd-threaded${BUILD[device]}.wasm`,
   };
 }
 
@@ -37,30 +37,30 @@ async function hasWebGPU() {
   }
 }
 
+/** ?device=wasm or ?device=webgpu forces one (for testing); otherwise WebGPU if it works here. */
+async function pickDevice() {
+  const forced = new URLSearchParams(location.search).get('device');
+  if (forced === 'wasm' || forced === 'webgpu') return { dev: forced, forced: true };
+  try {
+    if (localStorage.getItem(CPU_ONLY_KEY)) return { dev: 'wasm', forced: false };
+  } catch { /* no storage: just try WebGPU again */ }
+  return { dev: (await hasWebGPU()) ? 'webgpu' : 'wasm', forced: false };
+}
+
 let generator = null;
 let device = null;
-
-/** Is the model already in this browser's cache? */
-export async function isCached() {
-  try {
-    if (typeof caches === 'undefined') return false;
-    const cache = await caches.open(env.cacheKey || 'transformers-cache');
-    const url = `${env.remoteHost.replace(/\/$/, '')}/${MODEL.id}/resolve/main/onnx/${MODEL.file}`;
-    return Boolean(await cache.match(url));
-  } catch {
-    return false;
-  }
-}
 
 /**
  * @param {(p: {loaded?: number, total?: number, progress?: number, status: string}) => void} onProgress
  * @returns {Promise<{device: string}>}
+ * If WebGPU fails, this throws an error with `useCpu = true`: the runtime is
+ * already set up for WebGPU in this page, so the CPU needs a page reload.
  */
 export async function loadModel(onProgress = () => {}) {
   if (generator) return { device };
-  const webgpu = await hasWebGPU();
-  const tryDevice = async (dev) => {
-    useLocalRuntime(dev === 'webgpu');
+  const { dev, forced } = await pickDevice();
+  useLocalRuntime(dev);
+  try {
     generator = await pipeline('text-generation', MODEL.id, {
       dtype: MODEL.dtype,
       device: dev,
@@ -68,18 +68,21 @@ export async function loadModel(onProgress = () => {}) {
         if (p.status === 'progress_total' || p.status === 'ready') onProgress(p);
       },
     });
-    device = dev;
-  };
-  if (webgpu) {
-    try {
-      await tryDevice('webgpu');
-      return { device };
-    } catch (err) {
-      console.warn('WebGPU load failed, falling back to WASM', err);
-      generator = null;
+    // A session can load on a GPU and still fail on the first run; find out now.
+    if (dev === 'webgpu') await generator([{ role: 'user', content: 'Hi' }], { max_new_tokens: 1 });
+  } catch (err) {
+    generator = null;
+    // A failed download is not a GPU problem; only a runtime error moves us to the CPU.
+    const gpuFault = /session|ERROR_CODE|OrtRun|webgpu|gpu|shader|adapter/i.test(String(err && err.message));
+    if (dev === 'webgpu' && !forced && gpuFault) {
+      try { localStorage.setItem(CPU_ONLY_KEY, '1'); } catch { /* not saved */ }
+      const e = new Error(`WebGPU did not work here (${err.message})`);
+      e.useCpu = true;
+      throw e;
     }
+    throw err;
   }
-  await tryDevice('wasm');
+  device = dev;
   return { device };
 }
 
@@ -88,13 +91,9 @@ export function modelDevice() {
 }
 
 /** One short, greedy answer. Returns the raw text; the caller checks it. */
-export async function generate(prompt, maxNewTokens = 64) {
+export async function generate(prompt) {
   if (!generator) throw new Error('model not loaded');
-  const out = await generator([{ role: 'user', content: prompt }], {
-    max_new_tokens: maxNewTokens,
-    do_sample: false,
-    repetition_penalty: 1.1,
-  });
+  const out = await generator([{ role: 'user', content: prompt }], GENERATION);
   const last = out?.[0]?.generated_text;
   return Array.isArray(last) ? String(last.at(-1)?.content ?? '') : String(last ?? '');
 }

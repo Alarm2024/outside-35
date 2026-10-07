@@ -13,3 +13,6 @@ export const MODEL = {
   licenseUrl: 'https://ai.google.dev/gemma/terms',
   modelUrl: 'https://huggingface.co/onnx-community/gemma-3-270m-it-ONNX',
 };
+
+// One greedy answer, the same in the browser and in the CI model check.
+export const GENERATION = { max_new_tokens: 64, do_sample: false, repetition_penalty: 1.1 };

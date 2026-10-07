@@ -54,46 +54,75 @@ export function timeOfDay(start, solarNoon) {
 
 const ACTIVITY_WORDS = { walk: 'a short walk', hike: 'a hike', garden: 'time in the garden' };
 
-export function buildPrompt({ activity, words, seasonName, part }) {
-  const weatherLine = words
-    ? `temperature ${words.temp}, ${words.rain}, ${words.sun}, ${words.wind}`
-    : 'unknown (do not describe the weather)';
-  return [
-    `Someone wants to go outside for ${ACTIVITY_WORDS[activity]}.`,
+// What the model may choose from. It picks; it does not invent. The first three
+// of each list are the built-in choice when the model is not used.
+const OPTIONS = {
+  walk: ['water', 'comfortable shoes', 'a snack', 'sunglasses', 'a small bag', 'a notebook'],
+  hike: ['water', 'sturdy shoes', 'a charged phone', 'a snack', 'a map', 'a first aid kit', 'a torch'],
+  garden: ['gloves', 'water', 'a kneeling pad', 'a hat', 'a trowel', 'a watering can'],
+};
+
+/** Lower case, no article, no trailing punctuation: how bring items are compared. */
+export function normItem(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/[.!*_`"]+$/g, '')
+    .replace(/^(a|an|some|the)\s+/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * The bring list, decided by code from the data.
+ * required: always shown, each with the reason (from the data, or "weather unknown").
+ * optional: the list the model picks three from.
+ */
+export function bringOptions(activity, words) {
+  const required = [];
+  if (!words) {
+    required.push({ item: 'a light layer', why: 'weather unknown' });
+  } else {
+    if (['rain likely', 'thunderstorms possible', 'some chance of rain'].includes(words.rain)) required.push({ item: 'a rain jacket', why: words.rain });
+    if (words.sun === 'strong sun') required.push({ item: 'a hat', why: 'strong sun' }, { item: 'sunscreen', why: 'strong sun' });
+    if (['freezing', 'cold', 'cool'].includes(words.temp)) required.push({ item: 'a warm layer', why: words.temp });
+    if (['warm', 'hot'].includes(words.temp)) required.push({ item: 'extra water', why: words.temp });
+    if (words.wind === 'windy') required.push({ item: 'a windproof layer', why: 'windy' });
+  }
+  const taken = new Set(required.map((r) => normItem(r.item)));
+  const optional = OPTIONS[activity].filter((o) => !taken.has(normItem(o)));
+  return { required, optional };
+}
+
+export const requiredLabel = (r) => `${r.item} (${r.why})`;
+
+export function buildPrompt({ activity, words, seasonName, part, options = bringOptions(activity, words) }) {
+  const weatherLine = words ? `${words.temp}, ${words.rain}, ${words.sun}, ${words.wind}` : 'unknown';
+  const lines = [
+    `Plan: ${ACTIVITY_WORDS[activity]} outside.`,
     `Weather: ${weatherLine}.`,
     `Season: ${seasonName}. Time of day: ${part}.`,
-    'Write exactly two lines and nothing else:',
-    'BRING: three short things to bring, separated by commas',
-    'NOTICE: one short sentence about one thing to notice outside, like a bird, a tree or the sky',
-    'Do not write any numbers. Do not predict the weather.',
-  ].join('\n');
+  ];
+  if (options.required.length) lines.push(`Already packed: ${options.required.map((r) => r.item).join(', ')}.`);
+  lines.push(
+    `Pick the three most useful things to bring from this list: ${options.optional.join(', ')}.`,
+    'Then write one short sentence about one thing to look at or listen to outside, like a bird, a tree or the sky.',
+    'Reply in exactly this format:',
+    'BRING: thing, thing, thing',
+    'NOTICE: sentence',
+  );
+  return lines.join('\n');
 }
 
 // Built-in text, used when the model is not loaded or its answer fails the
 // never-guess check. Plain rules, written by people, chosen by the data.
-const BASE_BRING = {
-  walk: ['water', 'comfortable shoes'],
-  hike: ['water', 'a snack', 'sturdy shoes', 'a charged phone'],
-  garden: ['gloves', 'water'],
-};
-
 export function fallbackBring(activity, words) {
-  const items = [...BASE_BRING[activity]];
-  if (!words) {
-    items.push('a light layer (weather unknown)');
-    return items;
-  }
-  if (words.rain === 'rain likely' || words.rain === 'thunderstorms possible' || words.rain === 'some chance of rain') items.push('a rain jacket');
-  if (words.sun === 'strong sun') items.push('a hat and sunscreen');
-  if (['freezing', 'cold', 'cool'].includes(words.temp)) items.push('a warm layer');
-  if (['warm', 'hot'].includes(words.temp)) items.push('extra water');
-  if (words.wind === 'windy') items.push('a windproof layer');
-  return [...new Set(items)];
+  const { required, optional } = bringOptions(activity, words);
+  return [...required.map(requiredLabel), ...optional.slice(0, 3)];
 }
 
 const NOTICE = [
-  'Look up once: what shape are the clouds making right now?',
-  'Find one tree and notice how its leaves move in the wind.',
+  'Look up once: what is moving in the sky right now?',
+  'Find one tree and notice the shape of its leaves.',
   'Stop for a moment and count the different bird calls you can hear.',
   'Notice the colour of the sky near the horizon versus straight up.',
   'Find one small plant growing somewhere it should not be.',
