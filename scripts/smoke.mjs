@@ -7,7 +7,8 @@
 //   MODEL=1 MODEL_DEVICE=webgpu npm run smoke # + the real model on WebGPU (SwiftShader, no GPU needed)
 import { chromium } from 'playwright-core';
 import http from 'node:http';
-import { readFile, stat, mkdir } from 'node:fs/promises';
+import { readFile, stat, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
@@ -32,13 +33,16 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://localhost:${server.address().port}/`;
 
 const device = process.env.MODEL ? (process.env.MODEL_DEVICE === 'webgpu' ? 'webgpu' : 'wasm') : null;
-const browser = await chromium.launch({
+// A real profile on disk, like a phone's browser. A throwaway (incognito-like)
+// context has a small storage quota, too small to keep 344 MB of weights.
+const profile = await mkdtemp(path.join(os.tmpdir(), 'outside35-'));
+const context = await chromium.launchPersistentContext(profile, {
   executablePath: process.env.CHROMIUM_PATH || undefined,
   // A software WebGPU adapter, so the WebGPU path runs without a GPU.
   args: device === 'webgpu' ? ['--enable-unsafe-webgpu', '--use-webgpu-adapter=swiftshader', '--enable-features=Vulkan'] : [],
+  viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, locale: 'en-GB', timezoneId: 'Europe/London',
 });
-const context = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, locale: 'en-GB', timezoneId: 'Europe/London' });
-const page = await context.newPage();
+const page = context.pages()[0] || (await context.newPage());
 const external = [];
 // The context sees the model worker's requests too, not only the page's.
 context.on('request', (r) => {
@@ -47,10 +51,21 @@ context.on('request', (r) => {
 });
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
+// Warnings from the page and the model worker, printed if a step fails.
+const consoleLines = [];
+page.on('console', (m) => {
+  if (m.type() === 'warning' || m.type() === 'error') consoleLines.push(`${m.type()}: ${m.text().slice(0, 300)}`);
+});
 
 let passed = 0;
 const step = async (name, fn) => {
-  await fn();
+  try {
+    await fn();
+  } catch (err) {
+    console.log(`  FAIL  ${name}`);
+    if (consoleLines.length) console.log(`  browser console:\n    ${consoleLines.slice(-15).join('\n    ')}`);
+    throw err;
+  }
   passed += 1;
   console.log(`  ok  ${name}`);
 };
@@ -185,8 +200,13 @@ if (process.env.MODEL) {
     await page.click('#btn-model');
     await waitText('#model-v', /ready|could not load|cannot run it/, 20 * 60000);
     const mv = await page.textContent('#model-v');
+    const est = await page.evaluate(() => navigator.storage.estimate());
+    const line = `Browser storage: ${(est.usage / 1e6).toFixed(0)} MB used of ${(est.quota / 1e6).toFixed(0)} MB allowed`;
+    console.log(`  ${line}`);
+    summary.push(line);
     assert.match(mv, /ready/, mv);
     assert.match(mv, where, mv);
+    assert.doesNotMatch(mv, /not saved/, mv);
     assert.match(await page.textContent('#foot-model'), /written by Gemma/);
     summary.push(`Loaded in the browser in ${((Date.now() - t) / 1000).toFixed(0)} s: ${mv}`);
   });
@@ -230,6 +250,7 @@ if (process.env.MODEL) {
   }
 }
 
-await browser.close();
+await context.close();
+await rm(profile, { recursive: true, force: true });
 server.close();
 console.log(`\nsmoke: ${passed} checks passed`);

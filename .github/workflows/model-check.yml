@@ -62,7 +62,7 @@ jobs:
         with:
           path: .hf-cache
           key: hf-gemma-3-270m-it-q4-v1
-      - name: Gemma in Node (same prompt and check as the app)
+      - name: Gemma in Node (same ranking code as the app)
         run: npm run model-check
       - name: Build the site
         run: npm run build

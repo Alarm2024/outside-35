@@ -108,6 +108,7 @@ function renderModel() {
     const where = m.device === 'webgpu' ? 'your GPU (WebGPU)' : 'your CPU (WebAssembly)';
     v.replaceChildren(el('span', `${MODEL.name}: ready`, 'ok'), ` · running on ${where}`);
     if (m.fellBack) v.append(' (WebGPU did not work on this device, so it uses the CPU)');
+    if (m.saved === false) v.append(' · not saved for use with no signal: this browser did not allow the storage, so it will download again next time');
   } else if (m.status === 'unsupported') {
     v.replaceChildren(`${MODEL.name}: this browser cannot run it (${m.error}). Nothing was downloaded. Plans still work with built-in text.`);
     btn.textContent = 'Try again';
@@ -218,7 +219,9 @@ async function loadModel() {
         renderModel();
       },
     );
-    state.model = { status: 'ready', device, fellBack, error: null, progress: 100, stage: null };
+    // Say so if the browser would not keep the weights: then it is not offline-ready.
+    const saved = await modelIsCached();
+    state.model = { status: 'ready', device, fellBack, saved, error: null, progress: 100, stage: null };
   } catch (err) {
     console.error(err);
     const message = err && err.message ? err.message.slice(0, 160) : 'unknown error';
