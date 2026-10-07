@@ -7,71 +7,94 @@ const cool = conditionWords({ minTemp: 12, maxTemp: 16, maxPop: 10, maxUv: 2, ma
 const walk = bringOptions('walk', cool).optional;
 const ok = 'BRING: water, a snack, comfortable shoes\nNOTICE: Look for a bird landing on the nearest tree.';
 
+const check = (text, words = cool, options = walk) => checkModelOutput(text, { words, options });
+
 test('accepts three picks from the list and one sentence', () => {
-  const r = checkModelOutput(ok, { words: cool, options: walk });
-  assert.equal(r.ok, true);
-  assert.deepEqual(r.picks, ['water', 'a snack', 'comfortable shoes']);
-  assert.deepEqual(r.dropped, []);
-  assert.match(r.notice, /bird/);
+  const r = check(ok);
+  assert.equal(r.bring.ok, true);
+  assert.deepEqual(r.bring.picks, ['water', 'a snack', 'comfortable shoes']);
+  assert.deepEqual(r.bring.dropped, []);
+  assert.equal(r.notice.ok, true);
+  assert.match(r.notice.text, /bird/);
 });
 
-test('tolerates markdown, articles, case and plurals', () => {
-  const r = checkModelOutput('**BRING:** Water, snacks, the notebook.\n- **NOTICE:** Listen for the quietest sound nearby.', { words: cool, options: walk });
-  assert.equal(r.ok, true);
-  assert.deepEqual(r.picks, ['water', 'a snack', 'a notebook']);
+test('tolerates markdown, articles, case, plurals and loose labels', () => {
+  const r = check('**BRING:** Water, snacks, the notebook.\n- **Noticeable:** Listen for the quietest sound nearby.');
+  assert.deepEqual(r.bring.picks, ['water', 'a snack', 'a notebook']);
+  assert.equal(r.notice.text, 'Listen for the quietest sound nearby.');
 });
 
 test('drops things that are not on the list, and says which', () => {
-  const r = checkModelOutput('BRING: water, a kite, sunglasses\nNOTICE: Watch one tree for a whole minute.', { words: cool, options: walk });
-  assert.equal(r.ok, true);
-  assert.deepEqual(r.picks, ['water', 'sunglasses']);
-  assert.deepEqual(r.dropped, ['a kite']);
+  const r = check('BRING: water, a kite, sunglasses\nNOTICE: Watch one tree for a whole minute.');
+  assert.deepEqual(r.bring.picks, ['water', 'sunglasses']);
+  assert.deepEqual(r.bring.dropped, ['a kite']);
 });
 
-test('rejects sentences in BRING (real answers from the first CI run)', () => {
+test('copying the whole list is not choosing (real answer, second CI run)', () => {
+  const r = check('BRING: water, comfortable shoes, a snack, sunglasses, a small bag, a notebook.\nNOTICE: Look for the tallest tree on your way.');
+  assert.equal(r.bring.ok, false);
+  assert.match(r.bring.reason, /listed 6 things/);
+  assert.equal(r.notice.ok, true, 'a good NOTICE is still used');
+});
+
+test('rejects sentences in BRING (real answers from CI runs)', () => {
   for (const bring of [
     'A warm sweater is essential for staying cool and wet.',
     'A gentle breeze is blowing, making it feel cool and refreshing.',
+    'A good quality pair of hiking boots with ankle support is essential for navigating any terrain.',
   ]) {
-    const r = checkModelOutput(`BRING: ${bring}\nNOTICE: Look at the tallest tree you can see.`, { words: cool, options: walk });
-    assert.equal(r.ok, false, bring);
-    assert.match(r.reason, /from the list/);
+    const r = check(`BRING: ${bring}\nNOTICE: Look at the tallest tree you can see.`);
+    assert.equal(r.bring.ok, false, bring);
+    assert.match(r.bring.reason, /from the list/);
   }
 });
 
 test('rejects any number, even a plausible one', () => {
-  const r = checkModelOutput('BRING: water, a snack\nNOTICE: It is 18 degrees, look at the sky.', { words: cool, options: walk });
-  assert.equal(r.ok, false);
-  assert.match(r.reason, /number/);
+  const r = check('BRING: water, a snack\nNOTICE: It is 18 degrees, look at the sky.');
+  assert.equal(r.notice.ok, false);
+  assert.match(r.notice.reason, /number/);
+  assert.equal(r.bring.ok, true);
+});
+
+test('NOTICE must name something to notice, not repeat the prompt (real answers)', () => {
+  for (const n of [
+    'The weather is described as "cool, dry, weak sun," with a "calm" season.',
+    'observe a bird, a tree or the sky.',
+    'Write one short sentence about a bird.',
+  ]) {
+    const r = check(`BRING: water, a snack\nNOTICE: ${n}`);
+    assert.equal(r.notice.ok, false, n);
+    assert.match(r.notice.reason, /repeated the prompt/);
+  }
 });
 
 test('with no weather data, any weather word in NOTICE is a guess', () => {
   const opts = bringOptions('walk', null).optional;
-  for (const n of ['A gentle breeze is blowing through the trees.', 'It will rain later, watch the clouds.', 'Enjoy the warm afternoon sun on your face.', 'The sky is cloudy and grey today.']) {
-    const r = checkModelOutput(`BRING: water, a snack\nNOTICE: ${n}`, { words: null, options: opts });
-    assert.equal(r.ok, false, n);
-    assert.match(r.reason, /no weather data/);
+  for (const n of ['A gentle breeze is blowing through the trees.', 'It will rain later, watch the clouds.', 'Enjoy the warm afternoon sun on your face.', 'The sky looks cloudy and grey today.']) {
+    const r = check(`BRING: water, a snack\nNOTICE: ${n}`, null, opts);
+    assert.equal(r.notice.ok, false, n);
+    assert.match(r.notice.reason, /no weather data/);
   }
-  assert.equal(checkModelOutput('BRING: water, a snack\nNOTICE: Look for the first bird you can hear.', { words: null, options: opts }).ok, true);
+  assert.equal(check('BRING: water, a snack\nNOTICE: Look for the first bird you can hear.', null, opts).notice.ok, true);
 });
 
 test('with weather data, a weather word must match what the model was given', () => {
   const breeze = 'BRING: water, a snack\nNOTICE: Watch the leaves move in the breeze.';
-  assert.equal(checkModelOutput(breeze, { words: cool, options: walk }).ok, true);
+  assert.equal(check(breeze).notice.ok, true);
   const calm = { ...cool, wind: 'calm' };
-  const r = checkModelOutput(breeze, { words: calm, options: bringOptions('walk', calm).optional });
-  assert.equal(r.ok, false);
-  assert.match(r.reason, /breeze/);
+  const r = check(breeze, calm, bringOptions('walk', calm).optional);
+  assert.equal(r.notice.ok, false);
+  assert.match(r.notice.reason, /breeze/);
   // Cloud cover is never given to the model, so it may never claim it.
-  assert.equal(checkModelOutput('BRING: water, a snack\nNOTICE: The overcast sky looks soft today.', { words: cool, options: walk }).ok, false);
+  assert.equal(check('BRING: water, a snack\nNOTICE: The overcast sky looks soft today.').notice.ok, false);
 });
 
-test('rejects echoes of the prompt, missing lines and links', () => {
-  assert.equal(checkModelOutput('BRING: thing, thing, thing\nNOTICE: sentence', { words: cool, options: walk }).ok, false);
-  assert.match(checkModelOutput('BRING: water, a snack\nNOTICE: Write one short sentence about a bird.', { words: cool, options: walk }).reason, /instructions/);
-  assert.equal(checkModelOutput('NOTICE: the sky is wide today', { words: cool, options: walk }).ok, false);
-  assert.equal(checkModelOutput('BRING: water, a snack\nNOTICE: see https://example.com for birds', { words: cool, options: walk }).ok, false);
-  assert.equal(checkModelOutput('', { words: cool, options: walk }).ok, false);
+test('missing lines, links and empty answers', () => {
+  const r = check('NOTICE: the sky is wide today');
+  assert.match(r.bring.reason, /no BRING line/);
+  assert.equal(check('BRING: thing, thing, thing\nNOTICE: sentence').notice.ok, false);
+  assert.equal(check('BRING: water, a snack\nNOTICE: see https://example.com for birds').notice.ok, false);
+  assert.match(check('').notice.reason, /nothing/);
 });
 
 test('the data decides what is required; the model only picks from the rest', () => {
