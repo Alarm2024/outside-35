@@ -35,17 +35,21 @@ If the app does not have the data, it says so: <code>UNKNOWN</code> plus the rea
 | Weather | [Open-Meteo](https://open-meteo.com), only when you tap **Check weather** | Free, no account, no API key. Your position is rounded to two decimals (about 1 km) before it is sent. |
 | Best time window | Code | The daylight slot with the lowest rain chance and the most comfortable temperature, wind and UV. With no weather, it is the earliest daylight slot that fits. Ends at least 15 min before sunset. |
 | What you must bring | Code | Chosen from the data, each with its reason: "a rain jacket (rain likely)", "sunscreen (strong sun)". With no weather: "a light layer (weather unknown)". |
-| The rest of "Bring", and "Notice" | **Gemma 3 270M IT**, in your browser | The model gets words, not numbers ("cool, dry, breezy, autumn, morning"). It picks three things from a fixed list for your plan and writes one sentence about something to notice. |
-| The never-guess check | Code | Anything the model picks that is not on the list is left out. The whole answer is thrown away if it has any digit or link, picks fewer than two things from the list, or uses a weather word the data does not support ("breeze" on a calm day, anything about rain, sun or wind when there is no forecast, cloud cover ever). The app then shows its built-in text and tells you why. |
+| Which Notice lines are allowed | Code | Lines written by people, each tied to the data it needs: "Watch how the rain darkens the ground" only with rain in the forecast, "Look for new buds" only in spring at your location. With no weather, no weather lines at all. |
+| The rest of "Bring", and "Notice" | **Gemma 3 270M IT**, in your browser | The model **ranks**; it does not write. It is asked about your plan in words, not numbers ("a hike on a cold, rain likely day in the morning in winter"), and scores every allowed answer by how much more likely it finds it for this plan than for no plan at all. Its top three things to bring and its top Notice line are shown, and the full ranking is one tap away. |
 
-The model writes the friendly words. Code works out every number. That split is what lets a 270M-parameter model sit in a "never guess" app.
+The model chooses; code decides what it may choose from and works out every number. It cannot invent a fact or an item, because every answer is a line we wrote that your data allows.
+
+**Why ranking, not writing.** We first asked Gemma 3 270M to write the lines. On ten test plans it copied the whole list instead of choosing, and its sentences were often off-topic ("The aroma of cinnamon and cloves is delicious!"). A word filter can catch numbers and weather claims, but not that. Ranking uses what a small model is good at, judging what fits, and every answer reads well. The measurements are in the pull request that made the change.
 
 ### The model
 
 - **Gemma 3 270M IT** (open weights from Google), ONNX build [`onnx-community/gemma-3-270m-it-ONNX`](https://huggingface.co/onnx-community/gemma-3-270m-it-ONNX), `q4` quantisation.
 - **Download:** about 344 MB, once (323 MB weights, 20 MB tokenizer, small config files). After that it loads from your browser's cache.
 - **Runs with** [Transformers.js](https://github.com/huggingface/transformers.js) 4.3.1 on WebGPU when your browser has it, otherwise on the CPU with WebAssembly. ONNX Runtime's WASM files are served from this site, not a CDN.
-- **Two runtime builds, on purpose.** The q4 file uses a quantized operator (`GatherBlockQuantized`) that ONNX Runtime's WebGPU-capable build runs only on the GPU. So WebGPU devices use that build, and every other device uses the plain build, which runs it on the CPU. If WebGPU fails on a device, the app remembers that and reloads once onto the CPU, with no second download. `npm run probe-ort` checks both builds against tiny graphs holding the same operators.
+- **Runs in a Web Worker,** so the page keeps responding while the model works.
+- **Two runtime builds, on purpose.** The q4 file uses a quantized operator (`GatherBlockQuantized`) that ONNX Runtime's WebGPU-capable build runs only on the GPU. So WebGPU devices use that build, and every other device uses the plain build, which runs it on the CPU. If WebGPU fails on a device, the app starts a fresh worker on the CPU and remembers that, with no second download.
+- **Checked before the download.** Before fetching 344 MB, the worker runs two tiny graphs (about 1 KB each) holding the model's quantized operators. If this browser cannot run them, it says so and downloads nothing. `npm run probe-ort` runs the same check on both builds in CI.
 - **No server inference, no closed-model API, no account.** The page makes only two kinds of outside requests, and only when you tap for them: the model files from Hugging Face (**Download**), and the forecast for your rounded position from Open-Meteo (**Check weather**).
 - **License:** the code here is MIT. Gemma's weights are under the [Gemma Terms of Use](https://ai.google.dev/gemma/terms); they are downloaded from Hugging Face, not stored in this repo.
 
@@ -55,10 +59,10 @@ It is a PWA. After the first visit, the app works with no signal. The model work
 
 ## What is tested
 
-- `npm test`: 33 unit tests. Sun times (Greenwich solstices within 3 min of the almanac, polar day and night), window picking, the never-guess check (including real weak answers from an earlier model run), weather parsing and staleness, and "the prompt has no numbers".
-- `npm run smoke`: headless Chromium against the built site. UNKNOWN states, UTC and local times, a weather fixture, offline reload via the service worker, and that without the model download the page contacts nobody except Open-Meteo, and only when asked.
+- `npm test`: 28 unit tests. Sun times (Greenwich solstices within 3 min of the almanac, polar day and night), window picking, which lines the data allows, the ranking maths, weather parsing and staleness, and "the questions have no numbers".
+- `npm run smoke`: headless Chromium against the built site. UNKNOWN states, UTC and local times, a weather fixture, offline reload via the service worker, a runtime that cannot run the model being reported before any download, the footer not claiming the model wrote anything until it is loaded, and that without the model download the page contacts nobody except Open-Meteo, and only when asked.
 - `npm run probe-ort`: the shipped ONNX Runtime builds against the model's quantized operators, on the CPU and on WebGPU (SwiftShader, a software GPU, so no graphics card is needed).
-- **Model check** (GitHub Actions, `model-check.yml`): loads the real Gemma 3 270M IT (q4) with the app's own prompt builder and never-guess check, and writes each answer to the job summary, used or discarded. It does this in Node, then in headless Chromium on the CPU and on WebGPU, each time making a plan, reloading with no signal, loading the model again from the browser cache and making another plan.
+- **Model check** (GitHub Actions, `model-check.yml`): loads the real Gemma 3 270M IT (q4) with the app's own ranking code and option lists, and writes what it chose for each test plan to the job summary. It fails if the choices do not change with the plan. It does this in Node, then in headless Chromium on the CPU and on WebGPU, each time making a plan, reloading with no signal, loading the model again from the browser cache and making another plan.
 - **Not tested automatically:** real phones and real GPUs. The WebGPU run uses a software GPU.
 
 ## Run it yourself

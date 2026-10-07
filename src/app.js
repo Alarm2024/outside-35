@@ -1,8 +1,8 @@
 import { ACTIVITIES, pickWindow } from './lib/window.js';
 import { daylightWindows, sunTimes } from './lib/sun.js';
 import { fetchForecast, weatherState, forecastToJSON, forecastFromJSON, round2, WEATHER_SOURCE } from './lib/weather.js';
-import { conditionWords, season, timeOfDay, buildPrompt, bringOptions, requiredLabel, fallbackBring, fallbackNotice } from './lib/plan.js';
-import { checkModelOutput } from './lib/guard.js';
+import { conditionWords, season, timeOfDay, bringOptions, requiredLabel, fallbackBring, noticeOptions, fallbackNotice } from './lib/plan.js';
+import { rankingQuestions } from './lib/rank.js';
 import { rangeLabel, hhmmUTC, localTime, deviceZone } from './lib/format.js';
 import { MODEL } from './lib/model-info.js';
 
@@ -33,7 +33,7 @@ const state = {
   locationReason: 'not shared yet (tap Use my location, or type it)',
   forecast: loadForecast(),
   forecastError: null,
-  model: { status: 'idle', device: null, error: null, progress: 0 },
+  model: { status: 'idle', device: null, error: null, progress: 0, stage: null, fellBack: false },
 };
 
 let modelModule = null;
@@ -98,16 +98,27 @@ function renderModel() {
   } else if (m.status === 'cached') {
     v.replaceChildren(`${MODEL.name}: saved on this device`);
     btn.textContent = 'Load model';
+  } else if (m.status === 'loading' && m.stage === 'checking') {
+    v.replaceChildren(`${MODEL.name}: checking this browser can run it (nothing downloaded yet)…`);
+    bar.removeAttribute('value');
   } else if (m.status === 'loading') {
     v.replaceChildren(`${MODEL.name}: loading… ${Math.round(m.progress)}%`);
     bar.value = m.progress;
   } else if (m.status === 'ready') {
     const where = m.device === 'webgpu' ? 'your GPU (WebGPU)' : 'your CPU (WebAssembly)';
     v.replaceChildren(el('span', `${MODEL.name}: ready`, 'ok'), ` · running on ${where}`);
+    if (m.fellBack) v.append(' (WebGPU did not work on this device, so it uses the CPU)');
+  } else if (m.status === 'unsupported') {
+    v.replaceChildren(`${MODEL.name}: this browser cannot run it (${m.error}). Nothing was downloaded. Plans still work with built-in text.`);
+    btn.textContent = 'Try again';
   } else if (m.status === 'error') {
     v.replaceChildren(`${MODEL.name}: could not load (${m.error}). Plans still work with built-in text.`);
     btn.textContent = 'Try again';
   }
+  // Only claim the model wrote anything when it is actually loaded.
+  $('foot-model').textContent = m.status === 'ready'
+    ? `Bring picks and Notice are written by ${MODEL.name}, an open-weight model, on your device, then checked by code. Times and weather come from code and data, never from the model.`
+    : 'Bring and Notice are built-in text until you load the model. Times and weather come from code and data, never from a model.';
 }
 
 function renderAll() {
@@ -191,30 +202,31 @@ async function checkWeather() {
 }
 
 async function loadModel() {
-  state.model = { ...state.model, status: 'loading', progress: 0, error: null };
+  state.model = { ...state.model, status: 'loading', progress: 0, error: null, stage: null };
   renderModel();
   try {
     modelModule = modelModule || (await import('./model.js'));
-    const { device } = await modelModule.loadModel((p) => {
-      if (typeof p.progress === 'number') {
-        state.model.progress = p.progress;
+    const { device, fellBack } = await modelModule.loadModel(
+      (p) => {
+        if (typeof p.progress === 'number') {
+          state.model.progress = p.progress;
+          renderModel();
+        }
+      },
+      (stage) => {
+        state.model.stage = stage;
         renderModel();
-      }
-    });
-    state.model = { status: 'ready', device, error: null, progress: 100 };
+      },
+    );
+    state.model = { status: 'ready', device, fellBack, error: null, progress: 100, stage: null };
   } catch (err) {
     console.error(err);
-    if (err.useCpu) {
-      // This page's runtime is set up for WebGPU; the CPU build needs a fresh page.
-      // The weights are already cached, so this costs no second download.
-      state.model = { status: 'loading', device: null, error: null, progress: 100 };
-      $('model-v').replaceChildren(`${MODEL.name}: WebGPU did not work on this device, switching to the CPU…`);
-      store.set('autoload', true);
-      location.reload();
-      return;
-    }
-    const reason = navigator.onLine ? (err && err.message ? err.message.slice(0, 120) : 'unknown error') : 'no signal, and it is not saved on this device yet';
-    state.model = { status: 'error', device: null, error: reason, progress: 0 };
+    const message = err && err.message ? err.message.slice(0, 160) : 'unknown error';
+    // Failing the operator check means this browser's runtime cannot run Gemma;
+    // that is found out before any download, and said plainly.
+    const unsupported = state.model.stage === 'checking';
+    const reason = unsupported || navigator.onLine ? message : 'no signal, and it is not saved on this device yet';
+    state.model = { status: unsupported ? 'unsupported' : 'error', device: null, error: reason, progress: 0, stage: null, fellBack: false };
   }
   renderModel();
 }
@@ -284,37 +296,37 @@ async function makePlan() {
   const words = win.status === 'OK' && win.basis === 'sun+weather' ? conditionWords(win.facts) : null;
   const seasonName = loc ? season(now, loc.lat) : 'unknown';
   const part = win.status === 'OK' && sun ? timeOfDay(win.start, sun.solarNoon) : 'unknown';
+  const plan = { activity: state.activity, words, seasonName, part };
   const options = bringOptions(state.activity, words);
-  const prompt = buildPrompt({ activity: state.activity, words, seasonName, part, options });
+  const notices = noticeOptions(plan);
+  const q = rankingQuestions(plan);
 
   $('out').hidden = false;
   renderTime(win, now, sun && !sun.polar ? sun : null);
-  $('o-prompt').textContent = prompt;
+  $('o-prompt').textContent = [
+    q.bring.question, ...options.optional.map((c) => `  · ${c}`), '',
+    q.notice.question, ...notices.map((c) => `  · ${c}`),
+  ].join('\n');
   $('o-raw-wrap').hidden = true;
 
   let bring = fallbackBring(state.activity, words);
-  let notice = fallbackNotice(now);
-  let source = `${MODEL.name} is not loaded, so this is the built-in text. Load the model to have it written on your device.`;
+  let notice = fallbackNotice(now, notices);
+  let source = `${MODEL.name} is not loaded, so this is the built-in choice. Load the model to have it choose on your device.`;
 
   if (state.model.status === 'ready') {
-    $('o-source').textContent = `${MODEL.name} is writing on your device…`;
+    $('o-source').textContent = `${MODEL.name} is choosing on your device…`;
     try {
       const t0 = performance.now();
-      const raw = await modelModule.generate(prompt);
+      const ranked = await modelModule.rankPlan(plan, options.optional, notices);
       const secs = ((performance.now() - t0) / 1000).toFixed(1);
-      $('o-raw').textContent = raw;
+      bring = [...options.required.map(requiredLabel), ...ranked.bring.slice(0, 3).map((r) => r.c)];
+      notice = ranked.notice[0].c;
+      source = `${MODEL.name} ranked our lists for this plan on your device in ${secs} s and chose the three things to bring and the thing to notice. It can only choose lines we wrote and your data allows, so it cannot invent a fact.`;
+      const line = (r) => `${r.score >= 0 ? '+' : ''}${r.score.toFixed(2)}  ${r.c}`;
+      $('o-raw').textContent = ['Bring:', ...ranked.bring.map(line), '', 'Notice:', ...ranked.notice.map(line)].join('\n');
       $('o-raw-wrap').hidden = false;
-      const check = checkModelOutput(raw, { words, options: options.optional });
-      if (check.ok) {
-        bring = [...options.required.map(requiredLabel), ...check.picks];
-        notice = check.notice;
-        source = `${MODEL.name} picked what to bring from a fixed list and wrote Notice, on your device in ${secs} s. Then code checked it: no numbers, no weather it was not given.`;
-        if (check.dropped.length) source += ` Left out because they were not on the list: ${check.dropped.slice(0, 3).map((d) => d.slice(0, 40)).join(', ')}.`;
-      } else {
-        source = `${MODEL.name}'s answer was not used because ${check.reason}. Showing the built-in text instead.`;
-      }
     } catch (err) {
-      source = `${MODEL.name} failed (${err.message}). Showing the built-in text instead.`;
+      source = `${MODEL.name} failed (${err.message}). Showing the built-in choice instead.`;
     }
   }
 
@@ -342,18 +354,12 @@ window.addEventListener('online', renderWeather);
 window.addEventListener('offline', renderWeather);
 
 renderAll();
-if (store.get('autoload')) {
-  // Back from the switch to the CPU (see loadModel).
-  store.set('autoload', null);
-  loadModel();
-} else {
-  modelIsCached().then((cached) => {
-    if (cached && state.model.status === 'idle') {
-      state.model.status = 'cached';
-      renderModel();
-    }
-  });
-}
+modelIsCached().then((cached) => {
+  if (cached && state.model.status === 'idle') {
+    state.model.status = 'cached';
+    renderModel();
+  }
+});
 
 const secure = location.protocol === 'https:' || ['localhost', '127.0.0.1'].includes(location.hostname);
 if ('serviceWorker' in navigator && secure) {

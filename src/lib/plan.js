@@ -1,8 +1,10 @@
-// What the model is told, and what we say when the model is not there.
+// The data side of the plan: condition words, what you must bring, and the
+// human-written options the model ranks.
 //
 // The model only ever sees WORDS derived from the data ("cool", "dry"), never
-// numbers, and is asked to write no numbers. Every number on screen comes from
-// code. That is how "never guess" survives a 270M-parameter model.
+// numbers, and it only ranks lines people wrote and the data allows. Every
+// number on screen comes from code. That is how "never guess" survives a
+// 270M-parameter model.
 
 export function conditionWords(facts) {
   if (!facts) return null;
@@ -52,10 +54,8 @@ export function timeOfDay(start, solarNoon) {
   return 'evening';
 }
 
-const ACTIVITY_WORDS = { walk: 'a short walk', hike: 'a hike', garden: 'time in the garden' };
-
-// What the model may choose from. It picks; it does not invent. The first three
-// of each list are the built-in choice when the model is not used.
+// What the model ranks. It picks; it does not invent. The first three of each
+// list are the built-in choice when the model is not loaded.
 const OPTIONS = {
   walk: ['water', 'comfortable shoes', 'a snack', 'sunglasses', 'a small bag', 'a notebook'],
   hike: ['water', 'sturdy shoes', 'a charged phone', 'a snack', 'a map', 'a first aid kit', 'a torch'],
@@ -75,7 +75,7 @@ export function normItem(s) {
 /**
  * The bring list, decided by code from the data.
  * required: always shown, each with the reason (from the data, or "weather unknown").
- * optional: the list the model picks three from.
+ * optional: the list the model ranks; its top three are shown.
  */
 export function bringOptions(activity, words) {
   const required = [];
@@ -95,42 +95,52 @@ export function bringOptions(activity, words) {
 
 export const requiredLabel = (r) => `${r.item} (${r.why})`;
 
-export function buildPrompt({ activity, words, seasonName, part, options = bringOptions(activity, words) }) {
-  const weatherLine = words ? `${words.temp}, ${words.rain}, ${words.sun}, ${words.wind}` : 'unknown';
-  const lines = [
-    `Plan: ${ACTIVITY_WORDS[activity]} outside.`,
-    `Weather: ${weatherLine}.`,
-    `Season: ${seasonName}. Time of day: ${part}.`,
-  ];
-  if (options.required.length) lines.push(`Already packed: ${options.required.map((r) => r.item).join(', ')}.`);
-  lines.push(
-    `Pick the three most useful things to bring from this list: ${options.optional.join(', ')}.`,
-    'Then write one short sentence about one thing to look at or listen to outside, like a bird, a tree or the sky.',
-    'Reply in exactly this format:',
-    'BRING: thing, thing, thing',
-    'NOTICE: sentence',
-  );
-  return lines.join('\n');
-}
-
-// Built-in text, used when the model is not loaded or its answer fails the
-// never-guess check. Plain rules, written by people, chosen by the data.
+// Built-in choice, used when the model is not loaded. Plain rules, written by
+// people, chosen by the data.
 export function fallbackBring(activity, words) {
   const { required, optional } = bringOptions(activity, words);
   return [...required.map(requiredLabel), ...optional.slice(0, 3)];
 }
 
-const NOTICE = [
-  'Look up once: what is moving in the sky right now?',
-  'Find one tree and notice the shape of its leaves.',
-  'Stop for a moment and count the different bird calls you can hear.',
-  'Notice the colour of the sky near the horizon versus straight up.',
-  'Find one small plant growing somewhere it should not be.',
-  'Watch where the light lands: which side of the street is brighter?',
-  'Listen for the quietest sound around you.',
+// Things to notice, written by people. Each line names the data it depends on;
+// code keeps only the lines the data allows (no rain line without a rain
+// forecast, no autumn line without a location), and the model ranks the rest.
+const NOTICES = [
+  { text: 'Listen for the quietest sound around you.' },
+  { text: 'Count the different bird calls you can hear.' },
+  { text: 'Find one tree and notice the shape of its leaves.' },
+  { text: 'Notice the colour of the sky near the horizon, then straight up.' },
+  { text: 'Find one small plant growing somewhere it should not be.' },
+  { text: 'Look for the first leaves changing colour.', season: ['autumn'] },
+  { text: 'Look for new buds on the branches.', season: ['spring'] },
+  { text: 'Look at the bare branches against the sky.', season: ['winter'] },
+  { text: 'Watch the bees and insects around the flowers.', season: ['summer'] },
+  { text: 'Notice your breath in the cold air.', temp: ['cold', 'freezing'] },
+  { text: 'Look for frost on the grass and leaves.', temp: ['freezing'] },
+  { text: 'Watch how the rain darkens the ground and the bark.', rain: ['rain likely', 'thunderstorms possible'] },
+  { text: 'Listen to the wind in the tallest tree you can see.', wind: ['windy', 'breezy'] },
+  { text: 'Find a patch of shade and feel how much cooler it is.', sun: ['strong sun'] },
+  { text: 'Watch the light change as the sun gets lower.', part: ['afternoon', 'evening'] },
+  { text: 'Listen for birds starting their morning songs.', part: ['morning'] },
+  { text: 'Touch the soil and notice whether it is dry or damp.', activity: ['garden'] },
+  { text: 'Notice where the path bends next, and what is just out of sight.', activity: ['walk', 'hike'] },
 ];
 
-export function fallbackNotice(date) {
+/** The Notice lines this plan's data allows. Weather lines need weather data. */
+export function noticeOptions({ activity, words, seasonName, part }) {
+  const has = (want, value) => !want || (value != null && want.includes(value));
+  return NOTICES.filter((n) => has(n.activity, activity)
+    && has(n.season, seasonName)
+    && has(n.part, part)
+    && has(n.temp, words && words.temp)
+    && has(n.rain, words && words.rain)
+    && has(n.wind, words && words.wind)
+    && has(n.sun, words && words.sun))
+    .map((n) => n.text);
+}
+
+/** Without the model: one allowed line, the same all day. */
+export function fallbackNotice(date, options) {
   const day = Math.floor(date.valueOf() / 86400000);
-  return NOTICE[day % NOTICE.length];
+  return options[day % options.length];
 }

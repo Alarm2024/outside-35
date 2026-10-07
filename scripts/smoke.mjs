@@ -40,7 +40,8 @@ const browser = await chromium.launch({
 const context = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, locale: 'en-GB', timezoneId: 'Europe/London' });
 const page = await context.newPage();
 const external = [];
-page.on('request', (r) => {
+// The context sees the model worker's requests too, not only the page's.
+context.on('request', (r) => {
   const u = new URL(r.url());
   if (u.hostname !== 'localhost') external.push(u.hostname);
 });
@@ -87,6 +88,7 @@ await step('loads with Walk selected and everything UNKNOWN', async () => {
   assert.match(await page.textContent('#loc-v'), /UNKNOWN/);
   assert.match(await page.textContent('#wx-v'), /UNKNOWN/);
   assert.match(await page.textContent('#btn-model'), /Download · \d+ MB, once/);
+  assert.match(await page.textContent('#foot-model'), /built-in text until you load the model/);
 });
 
 await step('no location: the time is UNKNOWN with a reason, nothing invented', async () => {
@@ -98,6 +100,7 @@ await step('no location: the time is UNKNOWN with a reason, nothing invented', a
   assert.doesNotMatch(t, /UTC/);
   assert.match(await page.textContent('#o-bring'), /weather unknown/);
   assert.match(await page.textContent('#o-source'), /not loaded/);
+  assert.doesNotMatch(await page.textContent('#foot-model'), /written by/);
   assert.doesNotMatch(await page.textContent('#o-prompt'), /[0-9]/);
 });
 
@@ -146,6 +149,19 @@ await step('works offline after the first visit (service worker)', async () => {
   await context.setOffline(false);
 });
 
+await step('a runtime that cannot run the model says so before any download', async () => {
+  // The asyncify build on the CPU lacks GatherBlockQuantized: the exact failure
+  // seen after a full 344 MB download before this check existed.
+  await page.goto(`${base}?device=wasm&build=asyncify`);
+  await page.click('#btn-model');
+  await page.waitForFunction(() => /cannot run it|ready|could not load/.test(document.querySelector('#model-v').textContent), null, { timeout: 60000 });
+  const mv = await page.textContent('#model-v');
+  assert.match(mv, /cannot run it/, mv);
+  assert.match(mv, /GatherBlockQuantized/, mv);
+  assert.match(mv, /Nothing was downloaded/, mv);
+  assert.doesNotMatch(await page.textContent('#foot-model'), /written by/);
+});
+
 await step('talks to nobody but Open-Meteo, and only when asked', async () => {
   const hosts = [...new Set(external)];
   assert.deepEqual(hosts, ['api.open-meteo.com'], `external hosts: ${hosts.join(', ')}`);
@@ -158,6 +174,7 @@ await step('no page errors', async () => {
 if (process.env.MODEL) {
   // The real model, in this browser: about 344 MB from the Hugging Face Hub.
   const where = device === 'webgpu' ? /WebGPU/ : /CPU \(WebAssembly\)/;
+  await page.goto(`${base}?device=${device}`);
   const summary = [];
   const waitText = (sel, re, ms) => page.waitForFunction(
     ([s, src]) => new RegExp(src).test(document.querySelector(s).textContent), [sel, re.source], { timeout: ms },
@@ -166,25 +183,26 @@ if (process.env.MODEL) {
   await step('real model: downloads and loads in the browser', async () => {
     const t = Date.now();
     await page.click('#btn-model');
-    await waitText('#model-v', /ready|could not load/, 20 * 60000);
+    await waitText('#model-v', /ready|could not load|cannot run it/, 20 * 60000);
     const mv = await page.textContent('#model-v');
     assert.match(mv, /ready/, mv);
     assert.match(mv, where, mv);
+    assert.match(await page.textContent('#foot-model'), /written by Gemma/);
     summary.push(`Loaded in the browser in ${((Date.now() - t) / 1000).toFixed(0)} s: ${mv}`);
   });
 
   const writePlan = async (label) => {
     await page.click('#btn-plan');
-    await waitText('#o-source', /picked what to bring|was not used|failed/, 10 * 60000);
+    await waitText('#o-source', /ranked our lists|failed/, 10 * 60000);
     const source = await page.textContent('#o-source');
     const raw = await page.textContent('#o-raw');
-    summary.push(`${label}: ${source}`, `  raw answer: ${JSON.stringify(raw)}`,
+    summary.push(`${label}: ${source}`, `  ranking:\n${raw.replace(/^/gm, '    ')}`,
       `  bring: ${await page.textContent('#o-bring')}`, `  notice: ${await page.textContent('#o-notice')}`);
-    assert.match(source, /picked what to bring|was not used/, source);
-    assert.ok(raw.trim().length > 0, 'the model answered');
+    assert.match(source, /ranked our lists/, source);
+    assert.match(raw, /Bring:[\s\S]*Notice:/, 'the ranking is shown');
   };
 
-  await step('real model: writes a plan, which is used or honestly discarded', async () => {
+  await step('real model: ranks the lists and chooses Bring and Notice', async () => {
     await writePlan('Online');
     await mkdir(path.join(root, 'docs'), { recursive: true });
     await page.evaluate(() => window.scrollTo(0, 0));
@@ -196,7 +214,7 @@ if (process.env.MODEL) {
     await page.reload();
     await waitText('#model-v', /saved on this device/, 30000);
     await page.click('#btn-model');
-    await waitText('#model-v', /ready|could not load/, 5 * 60000);
+    await waitText('#model-v', /ready|could not load|cannot run it/, 5 * 60000);
     const mv = await page.textContent('#model-v');
     assert.match(mv, /ready/, mv);
     await writePlan('Offline');

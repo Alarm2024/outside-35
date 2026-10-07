@@ -25,7 +25,8 @@ await rm(dist, { recursive: true, force: true });
 await mkdir(path.join(dist, 'vendor', 'ort'), { recursive: true });
 
 await build({
-  entryPoints: [path.join(src, 'app.js')],
+  // The model runs in its own worker (model-worker.js), off the page's main thread.
+  entryPoints: [path.join(src, 'app.js'), path.join(src, 'model-worker.js')],
   bundle: true,
   format: 'esm',
   splitting: true,
@@ -43,6 +44,12 @@ for (const f of ['index.html', 'styles.css', 'manifest.webmanifest']) {
   await cp(path.join(src, f), path.join(dist, f));
 }
 await cp(path.join(src, 'icons'), path.join(dist, 'icons'), { recursive: true });
+// Two ~1 KB graphs with the model's quantized operators: the worker runs them
+// before the 344 MB download, so a browser that cannot run Gemma says so first.
+await mkdir(path.join(dist, 'ort-check'), { recursive: true });
+for (const f of ['gather_block_quantized.onnx', 'matmul_nbits.onnx']) {
+  await cp(path.join(root, 'test', 'fixtures', 'ort', f), path.join(dist, 'ort-check', f));
+}
 await cp(path.join(root, 'LICENSE'), path.join(dist, 'LICENSE.txt'));
 await writeFile(path.join(dist, '.nojekyll'), '');
 
