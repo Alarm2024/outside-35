@@ -105,7 +105,7 @@ function renderModel() {
     v.replaceChildren(`${MODEL.name}: loading… ${Math.round(m.progress)}%`);
     bar.value = m.progress;
   } else if (m.status === 'ready') {
-    const where = m.device === 'webgpu' ? 'your GPU (WebGPU)' : 'your CPU (WebAssembly)';
+    const where = m.device === 'webgpu' ? 'your GPU (WebGPU)' : `your CPU (WebAssembly, ${m.threads === 1 ? '1 thread' : `${m.threads} threads`})`;
     v.replaceChildren(el('span', `${MODEL.name}: ready`, 'ok'), ` · running on ${where}`);
     if (m.fellBack) v.append(' (WebGPU did not work on this device, so it uses the CPU)');
     if (m.saved === false) v.append(' · not saved for use with no signal: this browser did not allow the storage, so it will download again next time');
@@ -202,12 +202,39 @@ async function checkWeather() {
   }
 }
 
+// The service worker makes pages it serves cross-origin isolated, so the model
+// can use more than one CPU thread. The first visit is served before it runs:
+// the model button reloads that page once, and loading carries on by itself.
+const RELOAD_KEY = 'o35:reload-for-threads';
+function reloadedForThreads() {
+  try {
+    if (sessionStorage.getItem(RELOAD_KEY) !== 'reloading') return false;
+    sessionStorage.setItem(RELOAD_KEY, 'done');
+    return true;
+  } catch {
+    return false;
+  }
+}
+function reloadForThreads() {
+  try {
+    // Only once: a browser that ignores the headers just runs on one thread.
+    if (self.crossOriginIsolated || !navigator.serviceWorker || !navigator.serviceWorker.controller) return false;
+    if (sessionStorage.getItem(RELOAD_KEY)) return false;
+    sessionStorage.setItem(RELOAD_KEY, 'reloading');
+  } catch {
+    return false;
+  }
+  location.reload();
+  return true;
+}
+
 async function loadModel() {
+  if (reloadForThreads()) return;
   state.model = { ...state.model, status: 'loading', progress: 0, error: null, stage: null };
   renderModel();
   try {
     modelModule = modelModule || (await import('./model.js'));
-    const { device, fellBack } = await modelModule.loadModel(
+    const { device, fellBack, threads } = await modelModule.loadModel(
       (p) => {
         if (typeof p.progress === 'number') {
           state.model.progress = p.progress;
@@ -221,7 +248,7 @@ async function loadModel() {
     );
     // Say so if the browser would not keep the weights: then it is not offline-ready.
     const saved = await modelIsCached();
-    state.model = { status: 'ready', device, fellBack, saved, error: null, progress: 100, stage: null };
+    state.model = { status: 'ready', device, fellBack, threads, saved, error: null, progress: 100, stage: null };
   } catch (err) {
     console.error(err);
     const message = err && err.message ? err.message.slice(0, 160) : 'unknown error';
@@ -363,12 +390,16 @@ window.addEventListener('online', renderWeather);
 window.addEventListener('offline', renderWeather);
 
 renderAll();
-modelIsCached().then((cached) => {
-  if (cached && state.model.status === 'idle') {
-    state.model.status = 'cached';
-    renderModel();
-  }
-});
+if (reloadedForThreads()) {
+  loadModel();
+} else {
+  modelIsCached().then((cached) => {
+    if (cached && state.model.status === 'idle') {
+      state.model.status = 'cached';
+      renderModel();
+    }
+  });
+}
 
 const secure = location.protocol === 'https:' || ['localhost', '127.0.0.1'].includes(location.hostname);
 if ('serviceWorker' in navigator && secure) {

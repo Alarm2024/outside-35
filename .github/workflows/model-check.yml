@@ -23,6 +23,8 @@ on:
       - 'test/scenarios.mjs'
       - 'scripts/bench-page.js'
       - 'scripts/bench.html'
+      - 'src/lib/baselines.json'
+      - 'src/sw.js'
       - 'test/fixtures/ort/**'
       - 'package-lock.json'
       - '.github/workflows/model-check.yml'
@@ -42,6 +44,8 @@ on:
       - 'test/scenarios.mjs'
       - 'scripts/bench-page.js'
       - 'scripts/bench.html'
+      - 'src/lib/baselines.json'
+      - 'src/sw.js'
       - 'test/fixtures/ort/**'
       - 'package-lock.json'
       - '.github/workflows/model-check.yml'
@@ -57,7 +61,7 @@ concurrency:
 jobs:
   gemma:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -84,14 +88,14 @@ jobs:
         timeout-minutes: 25
         env:
           MODEL: '1'
-          BENCH_RUNS: 'full:2,shared:6'
+          BENCH_RUNS: '[{"label": "before: one full run per answer, 1 thread (main today)", "mode": "full", "n": 2, "threads": 1}, {"label": "after: the app (prompt read once, shipped no-plan scores)", "mode": "shared", "n": 6, "shipped": true}, {"label": "after, in a browser without isolation (1 thread)", "mode": "shared", "n": 6, "threads": 1, "shipped": true}, {"label": "check: prompt read once, no-plan scores worked out here", "mode": "shared", "n": 2}]'
         run: npm run smoke
       - name: Gemma in the browser on WebGPU (software GPU), then again with no signal
-        timeout-minutes: 40
+        timeout-minutes: 50
         env:
           MODEL: '1'
           MODEL_DEVICE: webgpu
-          BENCH_RUNS: 'full:1,shared:2'
+          BENCH_RUNS: '[{"label": "the app on WebGPU (one full run per answer, as before)", "mode": "full", "from": 3, "n": 1}, {"label": "study: prompt read once on WebGPU (not used by the app)", "mode": "shared", "from": 3, "n": 1}]'
         run: npm run smoke
       - uses: actions/upload-artifact@v4
         if: always()

@@ -35,6 +35,7 @@ async function pickDevice() {
 let worker = null;
 let device = null;
 let fellBack = false;
+let threads = 1;
 let seq = 0;
 const pending = new Map();
 
@@ -74,16 +75,16 @@ function call(w, msg, onProgress = () => {}) {
  * fails, a fresh worker tries the CPU, with the weights already cached.
  * @param {(p: {progress?: number|null}) => void} onProgress
  * @param {(stage: 'checking'|'downloading') => void} onStage
- * @returns {Promise<{device: string, fellBack: boolean}>}
+ * @returns {Promise<{device: string, fellBack: boolean, threads: number}>}
  */
 export async function loadModel(onProgress = () => {}, onStage = () => {}) {
-  if (device) return { device, fellBack };
+  if (device) return { device, fellBack, threads };
   const { dev, forced } = await pickDevice();
   const tryDevice = async (d) => {
     const w = startWorker();
     try {
       onStage('checking');
-      await call(w, { type: 'init', device: d, build: forcedBuild(), base: new URL('./', document.baseURI).href, ortBase: new URL('vendor/ort/', document.baseURI).href });
+      ({ threads } = await call(w, { type: 'init', device: d, build: forcedBuild(), base: new URL('./', document.baseURI).href, ortBase: new URL('vendor/ort/', document.baseURI).href }));
       onStage('downloading');
       await call(w, { type: 'load' }, onProgress);
       return w;
@@ -104,7 +105,7 @@ export async function loadModel(onProgress = () => {}, onStage = () => {}) {
     device = 'wasm';
     fellBack = true;
   }
-  return { device, fellBack };
+  return { device, fellBack, threads };
 }
 
 export function modelDevice() {

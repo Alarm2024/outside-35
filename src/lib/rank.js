@@ -92,14 +92,18 @@ export function makeScorer(tokenizer, model) {
  * plain likelihood one Notice line won five of six test plans; this way the
  * choice follows the plan.)
  */
-export async function rank(score, { question, neutral, answer }, candidates, baselines = new Map()) {
+export async function rank(score, { question, neutral, answer }, candidates, baselines = new Map(), onScored = () => {}) {
   const out = [];
   for (const c of candidates) {
     const a = answer(c);
     // The no-plan score never changes, so it is worked out once per answer.
     const key = `${neutral}\n${a.prefix}${a.text}`;
-    if (!baselines.has(key)) baselines.set(key, await score(neutral, a));
+    if (!baselines.has(key)) {
+      baselines.set(key, await score(neutral, a));
+      onScored();
+    }
     out.push({ c, score: (await score(question, a)) - baselines.get(key) });
+    onScored();
   }
   return out.sort((x, y) => y.score - x.score);
 }

@@ -6,6 +6,7 @@
 import { AutoTokenizer, AutoModelForCausalLM, Tensor, env } from '@huggingface/transformers';
 import * as ort from 'onnxruntime-web/webgpu';
 import { MODEL } from './lib/model-info.js';
+import BASELINES from './lib/baselines.json';
 import { makeLM, makeScorer, rank, rankingQuestions, rankShared, rankSteps } from './lib/rank.js';
 
 env.allowLocalModels = false; // weights come from the Hub, then from the local cache
@@ -24,13 +25,26 @@ const BUILD = { webgpu: '.asyncify', wasm: '' };
 const CHECK_GRAPHS = ['gather_block_quantized.onnx', 'matmul_nbits.onnx'];
 
 let lm = null;
-let score = null; // the one-run-per-answer reference, for the browser bench
+let score = null; // one full model run per answer
 const baselines = new Map();
+
+/**
+ * The no-plan scores worked out once in CI with this exact model file (the
+ * model check fails if they drift). Used on the CPU, where the two ways of
+ * scoring give the same numbers; WebGPU works out its own.
+ */
+function shippedBaselines() {
+  if (BASELINES.model !== MODEL.id || BASELINES.dtype !== MODEL.dtype) return;
+  for (const [key, value] of Object.entries(BASELINES.scores)) baselines.set(key, value);
+}
 let base = '';
 let device = null;
 
-function useRuntime(dev, ortBase, build) {
+function useRuntime(dev, ortBase, build, threads) {
   const suffix = build ? { asyncify: '.asyncify', plain: '' }[build] : BUILD[dev];
+  // More than one thread needs a cross-origin isolated page (see sw.js).
+  // Measured on a copy of the model's largest layer with 4 cores: 3 to 4 times faster.
+  ort.env.wasm.numThreads = self.crossOriginIsolated ? threads || Math.min(4, navigator.hardwareConcurrency || 1) : 1;
   const paths = {
     mjs: `${ortBase}ort-wasm-simd-threaded${suffix}.mjs`,
     wasm: `${ortBase}ort-wasm-simd-threaded${suffix}.wasm`,
@@ -70,27 +84,30 @@ async function load(id) {
   const model = await AutoModelForCausalLM.from_pretrained(MODEL.id, { dtype: MODEL.dtype, device, progress_callback });
   lm = makeLM(tokenizer, model, Tensor);
   score = makeScorer(tokenizer, model);
+  if (device === 'wasm') shippedBaselines();
   // A session can load on a GPU and still fail on the first run; find out now.
   if (device === 'webgpu') await score('Hi', { prefix: '', text: 'Hello.' });
 }
 
 /**
  * Ranks this plan's Bring and Notice candidates, best first, reporting each
- * answer scored so the page can show progress. mode 'full' is the old way
- * (one full model run per answer), kept only so the bench can time it.
+ * answer scored so the page can show progress.
+ *
+ * On the CPU each question's prompt runs once and its cache is reused
+ * (rankShared): measured in CI, the same scores as one full run per answer.
+ * On WebGPU that is not so (in CI, on a software GPU, scores differed by up
+ * to 0.63), so WebGPU
+ * keeps one full run per answer. mode overrides this, for the bench.
  */
-async function rankPlan({ id, plan, bring, notice, mode }) {
+async function rankPlan({ id, plan, bring, notice, mode = device === 'wasm' ? 'shared' : 'full' }) {
   const q = rankingQuestions(plan);
-  if (mode === 'full') {
-    return { bring: await rank(score, q.bring, bring, baselines), notice: await rank(score, q.notice, notice, baselines) };
-  }
   const total = rankSteps(q.bring, bring, baselines) + rankSteps(q.notice, notice, baselines);
   let done = 0;
   const onScored = () => self.postMessage({ id, type: 'progress', done: (done += 1), total });
-  return {
-    bring: await rankShared(lm, q.bring, bring, baselines, onScored),
-    notice: await rankShared(lm, q.notice, notice, baselines, onScored),
-  };
+  const rankOne = mode === 'full'
+    ? (question, candidates) => rank(score, question, candidates, baselines, onScored)
+    : (question, candidates) => rankShared(lm, question, candidates, baselines, onScored);
+  return { bring: await rankOne(q.bring, bring), notice: await rankOne(q.notice, notice) };
 }
 
 self.onmessage = async ({ data }) => {
@@ -99,9 +116,9 @@ self.onmessage = async ({ data }) => {
     if (type === 'init') {
       device = data.device;
       base = data.base;
-      useRuntime(device, data.ortBase, data.build);
+      useRuntime(device, data.ortBase, data.build, data.threads);
       await check();
-      self.postMessage({ id, type: 'done' });
+      self.postMessage({ id, type: 'done', threads: ort.env.wasm.numThreads, isolated: Boolean(self.crossOriginIsolated) });
     } else if (type === 'load') {
       await load(id);
       self.postMessage({ id, type: 'done' });
@@ -109,9 +126,10 @@ self.onmessage = async ({ data }) => {
       if (!lm) throw new Error('model not loaded');
       self.postMessage({ id, type: 'done', ranked: await rankPlan(data) });
     } else if (type === 'forget') {
-      // The bench times each way from scratch.
+      // The bench times each way from scratch, with or without the shipped scores.
       baselines.clear();
-      self.postMessage({ id, type: 'done' });
+      if (data.shipped) shippedBaselines();
+      self.postMessage({ id, type: 'done', baselines: baselines.size });
     }
   } catch (err) {
     self.postMessage({ id, type: 'error', message: String((err && err.message) || err) });

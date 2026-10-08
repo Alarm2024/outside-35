@@ -8,11 +8,13 @@
 // It times two ways of scoring the same lists. Before: one full model run per
 // answer (makeScorer). After, the app's way: each question's prompt runs once
 // and its cache is reused (rankShared). Both must give the same scores.
+// It also works out every no-plan score and checks src/lib/baselines.json, which
+// the app ships for the CPU, against them (npm run baselines rewrites it).
 // Exit code 1 if the model cannot load, a score is not a number, the two ways
-// disagree, or the choices do not change with the plan (a scorer that ignores
-// the plan is broken).
+// disagree, the shipped no-plan scores are out of date, or the choices do not
+// change with the plan (a scorer that ignores the plan is broken).
 import { AutoTokenizer, AutoModelForCausalLM, Tensor, env } from '@huggingface/transformers';
-import { appendFile, writeFile } from 'node:fs/promises';
+import { appendFile, readFile, writeFile } from 'node:fs/promises';
 import { MODEL } from '../src/lib/model-info.js';
 import { allCandidates, bringOptions, noticeOptions, requiredLabel } from '../src/lib/plan.js';
 import { describePlan, makeLM, makeScorer, rank, rankingQuestions, rankShared, scoreShared } from '../src/lib/rank.js';
@@ -20,6 +22,10 @@ import { SCENARIOS, scenarioPlan } from '../test/scenarios.mjs';
 
 // The two ways may differ only by float rounding.
 const SAME = 1e-3;
+// The shipped no-plan scores must match this run (the same kernels each time).
+const SHIPPED_SAME = 1e-4;
+const BASELINES_FILE = new URL('../src/lib/baselines.json', import.meta.url);
+const WRITE = process.argv.includes('--write-baselines');
 
 env.cacheDir = './.hf-cache/'; // cached between CI runs
 
@@ -93,7 +99,8 @@ console.log(md);
 await writeFile('model-check.md', md);
 if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY, md);
 
-// Every no-plan score any plan can need, printed for the log (not the summary).
+// Every no-plan score any plan can need. The app ships them for the CPU
+// (src/lib/baselines.json); this checks that file is current.
 const all = allCandidates();
 const q0 = rankingQuestions(scenarioPlan(SCENARIOS[0]));
 const neutral = {};
@@ -102,8 +109,21 @@ for (const [q, list] of [[q0.bring, all.bring], [q0.notice, all.notice]]) {
   const s = await scoreShared(lm, q.neutral, answers);
   answers.forEach((a, i) => { neutral[`${q.neutral}\n${a.prefix}${a.text}`] = s[i]; });
 }
-console.log(`no-plan scores (${Object.keys(neutral).length}), model inputs: ${inputs.join(', ')}`);
-console.log(`NEUTRAL_JSON ${JSON.stringify(neutral)}`);
+const shipped = JSON.parse(await readFile(BASELINES_FILE, 'utf8'));
+if (WRITE) {
+  shipped.model = MODEL.id;
+  shipped.dtype = MODEL.dtype;
+  shipped.scores = neutral;
+  await writeFile(BASELINES_FILE, `${JSON.stringify(shipped, null, 2)}\n`);
+  console.log(`wrote ${Object.keys(neutral).length} no-plan scores to src/lib/baselines.json`);
+}
+const keys = Object.keys(neutral);
+const missing = keys.filter((k) => !(k in shipped.scores));
+const extra = Object.keys(shipped.scores).filter((k) => !(k in neutral));
+const shippedDiff = Math.max(0, ...keys.filter((k) => k in shipped.scores).map((k) => Math.abs(neutral[k] - shipped.scores[k])));
+const shippedLine = `Shipped no-plan scores (src/lib/baselines.json, used on the CPU): ${keys.length - missing.length} of ${keys.length} present, largest difference from this run ${shippedDiff.toExponential(1)} (allowed: ${SHIPPED_SAME}).`;
+console.log(`${shippedLine}\nmodel inputs: ${inputs.join(', ')}`);
+if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY, `${shippedLine}\n`);
 
 if (!finite) {
   console.error('a score was not a number');
@@ -111,6 +131,10 @@ if (!finite) {
 }
 if (!(maxDiff <= SAME)) {
   console.error(`the shared-prompt scores differ from the full-run scores by ${maxDiff}`);
+  process.exit(1);
+}
+if (missing.length || extra.length || shipped.model !== MODEL.id || shipped.dtype !== MODEL.dtype || !(shippedDiff <= SHIPPED_SAME)) {
+  console.error(`src/lib/baselines.json is out of date (${missing.length} missing, ${extra.length} extra, largest difference ${shippedDiff}): run npm run baselines`);
   process.exit(1);
 }
 if (distinct < 3) {
