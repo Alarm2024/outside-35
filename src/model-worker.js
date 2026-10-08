@@ -3,10 +3,10 @@
 // Each worker has its own ONNX Runtime, so moving from WebGPU to the CPU is a
 // new worker, not a page reload.
 
-import { AutoTokenizer, AutoModelForCausalLM, env } from '@huggingface/transformers';
+import { AutoTokenizer, AutoModelForCausalLM, Tensor, env } from '@huggingface/transformers';
 import * as ort from 'onnxruntime-web/webgpu';
 import { MODEL } from './lib/model-info.js';
-import { makeScorer, rank, rankingQuestions } from './lib/rank.js';
+import { makeLM, makeScorer, rank, rankingQuestions, rankShared, rankSteps } from './lib/rank.js';
 
 env.allowLocalModels = false; // weights come from the Hub, then from the local cache
 env.useBrowserCache = true;
@@ -23,7 +23,8 @@ const BUILD = { webgpu: '.asyncify', wasm: '' };
 // before anyone downloads 344 MB.
 const CHECK_GRAPHS = ['gather_block_quantized.onnx', 'matmul_nbits.onnx'];
 
-let score = null;
+let lm = null;
+let score = null; // the one-run-per-answer reference, for the browser bench
 const baselines = new Map();
 let base = '';
 let device = null;
@@ -67,15 +68,29 @@ async function load(id) {
   };
   const tokenizer = await AutoTokenizer.from_pretrained(MODEL.id, { progress_callback });
   const model = await AutoModelForCausalLM.from_pretrained(MODEL.id, { dtype: MODEL.dtype, device, progress_callback });
+  lm = makeLM(tokenizer, model, Tensor);
   score = makeScorer(tokenizer, model);
   // A session can load on a GPU and still fail on the first run; find out now.
   if (device === 'webgpu') await score('Hi', { prefix: '', text: 'Hello.' });
 }
 
-/** Ranks this plan's Bring and Notice candidates, best first. */
-async function rankPlan({ plan, bring, notice }) {
+/**
+ * Ranks this plan's Bring and Notice candidates, best first, reporting each
+ * answer scored so the page can show progress. mode 'full' is the old way
+ * (one full model run per answer), kept only so the bench can time it.
+ */
+async function rankPlan({ id, plan, bring, notice, mode }) {
   const q = rankingQuestions(plan);
-  return { bring: await rank(score, q.bring, bring, baselines), notice: await rank(score, q.notice, notice, baselines) };
+  if (mode === 'full') {
+    return { bring: await rank(score, q.bring, bring, baselines), notice: await rank(score, q.notice, notice, baselines) };
+  }
+  const total = rankSteps(q.bring, bring, baselines) + rankSteps(q.notice, notice, baselines);
+  let done = 0;
+  const onScored = () => self.postMessage({ id, type: 'progress', done: (done += 1), total });
+  return {
+    bring: await rankShared(lm, q.bring, bring, baselines, onScored),
+    notice: await rankShared(lm, q.notice, notice, baselines, onScored),
+  };
 }
 
 self.onmessage = async ({ data }) => {
@@ -91,8 +106,12 @@ self.onmessage = async ({ data }) => {
       await load(id);
       self.postMessage({ id, type: 'done' });
     } else if (type === 'rank') {
-      if (!score) throw new Error('model not loaded');
+      if (!lm) throw new Error('model not loaded');
       self.postMessage({ id, type: 'done', ranked: await rankPlan(data) });
+    } else if (type === 'forget') {
+      // The bench times each way from scratch.
+      baselines.clear();
+      self.postMessage({ id, type: 'done' });
     }
   } catch (err) {
     self.postMessage({ id, type: 'error', message: String((err && err.message) || err) });

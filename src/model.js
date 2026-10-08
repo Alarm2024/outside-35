@@ -113,9 +113,10 @@ export function modelDevice() {
 
 /**
  * Ranks human-written candidates for this plan, best first.
+ * @param {(p: {done: number, total: number}) => void} onProgress after each answer scored
  * @returns {Promise<{bring: {c: string, score: number}[], notice: {c: string, score: number}[]}>}
  */
-export async function rankPlan(plan, bring, notice) {
+export async function rankPlan(plan, bring, notice, onProgress = () => {}) {
   if (!worker || !device) throw new Error('model not loaded');
-  return (await call(worker, { type: 'rank', plan, bring, notice })).ranked;
+  return (await call(worker, { type: 'rank', plan, bring, notice }, onProgress)).ranked;
 }

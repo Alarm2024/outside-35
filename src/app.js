@@ -118,7 +118,7 @@ function renderModel() {
   }
   // Only claim the model wrote anything when it is actually loaded.
   $('foot-model').textContent = m.status === 'ready'
-    ? `Bring picks and Notice are written by ${MODEL.name}, an open-weight model, on your device, then checked by code. Times and weather come from code and data, never from the model.`
+    ? `Bring picks and Notice are chosen by ${MODEL.name}, an open-weight model, on your device, from lines we wrote and your data allows. Times and weather come from code and data, never from the model.`
     : 'Bring and Notice are built-in text until you load the model. Times and weather come from code and data, never from a model.';
 }
 
@@ -312,32 +312,38 @@ async function makePlan() {
   ].join('\n');
   $('o-raw-wrap').hidden = true;
 
-  let bring = fallbackBring(state.activity, words);
-  let notice = fallbackNotice(now, notices);
-  let source = `${MODEL.name} is not loaded, so this is the built-in choice. Load the model to have it choose on your device.`;
+  // The built-in choice shows at once; the model's choice replaces it when ready.
+  const show = (bring, notice, source) => {
+    $('o-bring').replaceChildren(...bring.map((b) => el('li', b)));
+    $('o-notice').textContent = notice;
+    $('o-source').textContent = source;
+  };
+  const builtIn = [fallbackBring(state.activity, words), fallbackNotice(now, notices)];
+  show(...builtIn, `${MODEL.name} is not loaded, so this is the built-in choice. Load the model to have it choose on your device.`);
+  $('out').scrollIntoView({ behavior: 'smooth', block: 'start' });
 
   if (state.model.status === 'ready') {
-    $('o-source').textContent = `${MODEL.name} is choosing on your device…`;
+    const ranking = (done, total) => `Built-in choice for now. ${MODEL.name} is ranking our lists for this plan on your device${total ? `: ${done}/${total}` : ''}…`;
+    $('o-source').textContent = ranking(0, 0);
     try {
       const t0 = performance.now();
-      const ranked = await modelModule.rankPlan(plan, options.optional, notices);
+      const ranked = await modelModule.rankPlan(plan, options.optional, notices, ({ done, total }) => {
+        $('o-source').textContent = ranking(done, total);
+      });
       const secs = ((performance.now() - t0) / 1000).toFixed(1);
-      bring = [...options.required.map(requiredLabel), ...ranked.bring.slice(0, 3).map((r) => r.c)];
-      notice = ranked.notice[0].c;
-      source = `${MODEL.name} ranked our lists for this plan on your device in ${secs} s and chose the three things to bring and the thing to notice. It can only choose lines we wrote and your data allows, so it cannot invent a fact.`;
+      show(
+        [...options.required.map(requiredLabel), ...ranked.bring.slice(0, 3).map((r) => r.c)],
+        ranked.notice[0].c,
+        `${MODEL.name} ranked our lists for this plan on your device in ${secs} s and chose the three things to bring and the thing to notice. It can only choose lines we wrote and your data allows, so it cannot invent a fact.`,
+      );
       const line = (r) => `${r.score >= 0 ? '+' : ''}${r.score.toFixed(2)}  ${r.c}`;
       $('o-raw').textContent = ['Bring:', ...ranked.bring.map(line), '', 'Notice:', ...ranked.notice.map(line)].join('\n');
       $('o-raw-wrap').hidden = false;
     } catch (err) {
-      source = `${MODEL.name} failed (${err.message}). Showing the built-in choice instead.`;
+      show(...builtIn, `${MODEL.name} failed (${err.message}). Showing the built-in choice instead.`);
     }
   }
-
-  $('o-bring').replaceChildren(...bring.map((b) => el('li', b)));
-  $('o-notice').textContent = notice;
-  $('o-source').textContent = source;
   btn.disabled = false;
-  $('out').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 // ── Wire up ──────────────────────────────────────────────────────────────
