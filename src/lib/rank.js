@@ -139,17 +139,43 @@ export function makeLM(tokenizer, model, Tensor) {
         dispose: () => { for (const t of Object.values(tensors)) t.dispose(); },
       };
     },
+    /** The first n positions of a cache, copied (dims [batch, heads, positions, size]). */
+    prefix(cache, n) {
+      const tensors = {};
+      for (const [name, t] of Object.entries(cache.tensors)) {
+        if (t.location === 'gpu-buffer') throw new Error('cutting a cache needs it on the CPU');
+        const [b, h, len, d] = t.dims;
+        const data = new t.data.constructor(b * h * n * d);
+        for (let i = 0; i < b * h; i += 1) data.set(t.data.subarray(i * len * d, (i * len + n) * d), i * n * d);
+        tensors[name] = new Tensor(t.type, data, [b, h, n, d]);
+      }
+      return { length: n, tensors };
+    },
   };
 }
 
 /**
  * Mean log-probability of each answer to one question. The prompt is the
- * same for every answer, so the model reads it once and keeps its cache;
- * each answer then costs only its own few tokens, with logits only where
- * they are read. Same scores as makeScorer, a fraction of the work.
+ * same for every answer, so the model reads it once and every answer after
+ * the first costs only its own few tokens. Same scores as makeScorer (one
+ * full run per answer) for a fraction of the work.
+ *
+ * In the browser's CPU build each model call costs about a second whatever
+ * its length, so the number of calls is what counts: with promptInFirstAnswer
+ * the shortest answer runs whole, and the start of its cache, which is
+ * exactly the prompt's (the model is causal), serves every other answer. One
+ * call per answer, none extra. That needs the cache in CPU memory; on WebGPU
+ * the prompt runs on its own first. (Answers cannot share a call: this
+ * model's attention, GroupQueryAttention, runs several new tokens on top of a
+ * cache only one row at a time.)
+ *
+ * maxRun caps the new tokens in one model call: a longer run is read in
+ * pieces, each continuing from the cache of the one before. (On WebGPU,
+ * measured in CI: every call of 32 or more new tokens gave other scores than
+ * the CPU, every call of up to 27 the same.)
  * @param {(n: number) => void} onScored called after each answer
  */
-export async function scoreShared(lm, question, answers, onScored = () => {}) {
+export async function scoreShared(lm, question, answers, onScored = () => {}, { promptInFirstAnswer = true, maxRun = 0 } = {}) {
   if (!answers.length) return [];
   const prompt = lm.prompt(question);
   const heads = new Map();
@@ -165,26 +191,70 @@ export async function scoreShared(lm, question, answers, onScored = () => {}) {
   // each answer's own run includes the row that predicts its first token.
   let shared = Math.min(...items.map((x) => x.from)) - 1;
   for (const x of items) shared = Math.min(shared, commonPrefixLength(items[0].ids, x.ids));
-  const head = shared >= 1 ? await lm.run(items[0].ids.slice(0, shared), null, 1) : null;
-  try {
-    const scores = [];
-    for (const x of items) {
-      const start = head ? shared : 0;
-      // Rows from the one before the answer's first token to the end.
-      const keep = Math.min(x.ids.length - x.from + 1, x.ids.length - start);
-      const run = await lm.run(x.ids.slice(start), head && head.cache, keep);
-      try {
-        const [, rows, vocab] = run.logits.dims;
-        scores.push(meanLogProbAt(run.logits.data, vocab, x.ids, x.from, x.ids.length - rows));
-      } finally {
-        run.dispose();
-      }
-      onScored(scores.length);
+  const order = items.map((_, i) => i).sort((a, b) => items[a].ids.length - items[b].ids.length);
+  const scores = new Array(items.length);
+  let done = 0;
+  // A run's logits end at the answer's last token, whatever it kept.
+  const score = (i, run) => {
+    const x = items[i];
+    const [, rows, vocab] = run.logits.dims;
+    scores[i] = meanLogProbAt(run.logits.data, vocab, x.ids, x.from, x.ids.length - rows);
+    onScored((done += 1));
+  };
+  // Rows from the one before the answer's first token to the end.
+  const keep = (x, start) => Math.min(x.ids.length - x.from + 1, x.ids.length - start);
+
+  const run = (ids, from, rows) => runInPieces(lm, ids, from, rows, maxRun);
+  let cache = null;
+  let head = null;
+  let rest = order;
+  if (promptInFirstAnswer) {
+    const first = items[order[0]];
+    const whole = await run(first.ids, null, keep(first, 0));
+    try {
+      score(order[0], whole);
+      if (items.length > 1 && shared >= 1) cache = lm.prefix(whole.cache, shared);
+    } finally {
+      whole.dispose();
     }
-    return scores;
+    rest = order.slice(1);
+  } else if (shared >= 1) {
+    head = await run(items[0].ids.slice(0, shared), null, 1);
+    cache = head.cache;
+  }
+  try {
+    const start = cache ? shared : 0;
+    for (const i of rest) {
+      const answer = await run(items[i].ids.slice(start), cache, keep(items[i], start));
+      try {
+        score(i, answer);
+      } finally {
+        answer.dispose();
+      }
+    }
   } finally {
     if (head) head.dispose();
   }
+  return scores;
+}
+
+/**
+ * lm.run, in pieces of at most max new tokens (0: no limit). The last piece
+ * holds the rows to keep, so it is longer when more rows are kept than max;
+ * each earlier piece's cache is released once the next piece has read it.
+ */
+export async function runInPieces(lm, ids, cache, keep, max) {
+  if (!max || ids.length <= max) return lm.run(ids, cache, keep);
+  const cuts = [ids.length - Math.min(ids.length, Math.max(max, keep))];
+  for (let end = cuts[0]; end > 0; end -= max) cuts.unshift(Math.max(0, end - max));
+  let last = null;
+  for (let k = 0; k < cuts.length; k += 1) {
+    const end = k + 1 < cuts.length ? cuts[k + 1] : ids.length;
+    const next = await lm.run(ids.slice(cuts[k], end), last ? last.cache : cache, end === ids.length ? keep : 1);
+    if (last) last.dispose();
+    last = next;
+  }
+  return last;
 }
 
 /** How many answers rankShared will score for one question (the progress total). */
@@ -197,14 +267,14 @@ export function rankSteps({ neutral, answer }, candidates, baselines) {
 }
 
 /** rank, with scoreShared: the no-plan scores first (once per answer), then this plan's. */
-export async function rankShared(lm, { question, neutral, answer }, candidates, baselines = new Map(), onScored = () => {}) {
+export async function rankShared(lm, { question, neutral, answer }, candidates, baselines = new Map(), onScored = () => {}, options = {}) {
   const answers = candidates.map(answer);
   const keys = answers.map((a) => `${neutral}\n${a.prefix}${a.text}`);
   const missing = answers.filter((_, i) => !baselines.has(keys[i]));
   if (missing.length) {
-    const s = await scoreShared(lm, neutral, missing, onScored);
+    const s = await scoreShared(lm, neutral, missing, onScored, options);
     missing.forEach((a, i) => baselines.set(`${neutral}\n${a.prefix}${a.text}`, s[i]));
   }
-  const scores = await scoreShared(lm, question, answers, onScored);
+  const scores = await scoreShared(lm, question, answers, onScored, options);
   return candidates.map((c, i) => ({ c, score: scores[i] - baselines.get(keys[i]) })).sort((x, y) => y.score - x.score);
 }

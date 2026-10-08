@@ -9,7 +9,7 @@
 //                                             # + times each plan both ways (scripts/bench-page.js)
 import { chromium } from 'playwright-core';
 import http from 'node:http';
-import { readFile, stat, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, stat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -299,26 +299,57 @@ if (process.env.MODEL) {
       summary.push('', 'Each plan timed in this browser (a plan that has to work out its no-plan scores pays for those too):');
       for (const r of result.rows || []) {
         summary.push(`  ${r.secs.toFixed(1).padStart(6)} s  ${r.label} [${r.threads} thread${r.threads === 1 ? '' : 's'}]  ·  ${r.plan}  →  ${r.ranked.bring.slice(0, 3).map((x) => x.c).join(', ')} | ${r.ranked.notice[0].c}`);
+        if (r.ranked.calls) {
+          const ms = r.ranked.calls.reduce((t, c) => t + c.ms, 0);
+          summary.push(`           ${r.ranked.calls.length} model calls, ${(ms / 1000).toFixed(1)} s (tokens+cached: ms) ${r.ranked.calls.map((c) => `${c.tokens}+${c.cached}:${c.ms}`).join(' ')}; the other ${(r.secs - ms / 1000).toFixed(1)} s is scoring and messages`);
+        }
       }
       assert.equal(result.error, undefined, result.error);
       // Every pair of runs that ranked the same plan: how far apart are the scores?
-      const score = (r, list, c) => r.ranked[list].find((y) => y.c === c).score;
+      // A line's score does not depend on the other lines, so lines both runs ranked must match.
       let maxDiff = 0;
       const rows = result.rows;
       for (let i = 0; i < rows.length; i += 1) {
         for (let j = i + 1; j < rows.length; j += 1) {
           if (rows[i].plan !== rows[j].plan) continue;
           for (const list of ['bring', 'notice']) {
-            for (const x of rows[i].ranked[list]) maxDiff = Math.max(maxDiff, Math.abs(x.score - score(rows[j], list, x.c)));
+            for (const x of rows[i].ranked[list]) {
+              const y = rows[j].ranked[list].find((z) => z.c === x.c);
+              if (y) maxDiff = Math.max(maxDiff, Math.abs(x.score - y.score));
+            }
           }
         }
       }
       summary.push(`  largest score difference between runs of the same plan: ${maxDiff.toExponential(1)}`);
-      if (device === 'webgpu') {
-        // Not used by the app on WebGPU; shown so the difference can be studied.
-        for (const r of rows) summary.push(`  ${r.label}: ${['bring', 'notice'].map((l) => r.ranked[l].map((x) => `${x.score.toFixed(3)} ${x.c}`).join('; ')).join(' || ')}`);
-      } else {
+      // Every score for one plan both devices rank, so CPU and WebGPU can be compared.
+      const scores = (r) => ['bring', 'notice'].map((l) => r.ranked[l].map((x) => `${x.score.toFixed(3)} ${x.c}`).join('; ')).join(' || ');
+      const shown = device === 'webgpu' ? rows : rows.filter((r) => r.plan === 'a short walk').slice(0, 1);
+      for (const r of shown) summary.push(`  scores, ${r.plan}, ${r.label}: ${scores(r)}`);
+      // The app's scores for every plan the CPU ranked, kept for the WebGPU run
+      // in the same job: the app's WebGPU scores for each plan must match them.
+      const scoresFile = path.join(root, 'model-check-scores.json');
+      const app = {};
+      for (const r of rows) if (r.mode === 'shared' && !app[r.plan]) app[r.plan] = r.ranked;
+      if (device === 'wasm') {
+        // On the CPU every way of ranking a plan must give the same scores.
         assert.ok(maxDiff <= 1e-3, `runs of the same plan disagree by ${maxDiff}`);
+        await writeFile(scoresFile, JSON.stringify(app));
+      } else {
+        // One full run per answer is shown for comparison only: it does not match the CPU here.
+        const cpu = await readFile(scoresFile, 'utf8').then(JSON.parse).catch(() => null);
+        const plans = Object.keys(app).filter((plan) => cpu && cpu[plan]);
+        if (!plans.length) summary.push('  (no CPU scores from this job to compare with)');
+        for (const plan of plans) {
+          let gap = 0;
+          for (const list of ['bring', 'notice']) {
+            for (const x of app[plan][list]) {
+              const y = cpu[plan][list].find((z) => z.c === x.c);
+              if (y) gap = Math.max(gap, Math.abs(x.score - y.score));
+            }
+          }
+          summary.push(`  the app on WebGPU against the CPU, ${plan}: largest score difference ${gap.toFixed(4)}`);
+          assert.ok(gap <= 0.02, `the app's WebGPU scores for "${plan}" differ from the CPU's by ${gap}`);
+        }
       }
     });
   }

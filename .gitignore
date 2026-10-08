@@ -5,3 +5,4 @@ dist/
 .hf-cache/
 model-check.md
 docs/screenshot-model-*.png
+model-check-scores.json
