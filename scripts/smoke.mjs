@@ -5,6 +5,8 @@
 //   npm run build && npm run smoke            # SCREENSHOT=1 also writes docs/screenshot.png
 //   MODEL=1 npm run smoke                     # + the real model on the CPU (344 MB download)
 //   MODEL=1 MODEL_DEVICE=webgpu npm run smoke # + the real model on WebGPU (SwiftShader, no GPU needed)
+//   BENCH_RUNS=full:2,shared:6 (with MODEL=1, after BENCH=1 npm run build)
+//                                             # + times each plan both ways (scripts/bench-page.js)
 import { chromium } from 'playwright-core';
 import http from 'node:http';
 import { readFile, stat, mkdir, mkdtemp, rm } from 'node:fs/promises';
@@ -164,17 +166,38 @@ await step('works offline after the first visit (service worker)', async () => {
   await context.setOffline(false);
 });
 
-await step('a runtime that cannot run the model says so before any download', async () => {
-  // The asyncify build on the CPU lacks GatherBlockQuantized: the exact failure
-  // seen after a full 344 MB download before this check existed.
-  await page.goto(`${base}?device=wasm&build=asyncify`);
-  await page.click('#btn-model');
-  await page.waitForFunction(() => /cannot run it|ready|could not load/.test(document.querySelector('#model-v').textContent), null, { timeout: 60000 });
-  const mv = await page.textContent('#model-v');
-  assert.match(mv, /cannot run it/, mv);
-  assert.match(mv, /GatherBlockQuantized/, mv);
-  assert.match(mv, /Nothing was downloaded/, mv);
-  assert.doesNotMatch(await page.textContent('#foot-model'), /written by/);
+await step('the model button reloads a first visit once: isolated, so the model gets every CPU thread', async () => {
+  // A new profile: its first page is served before the service worker runs,
+  // so it is not cross-origin isolated until that one reload.
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'outside35-first-'));
+  const fresh = await chromium.launchPersistentContext(dir, { executablePath: process.env.CHROMIUM_PATH || undefined });
+  const hosts = [];
+  fresh.on('request', (r) => {
+    const u = new URL(r.url());
+    if (u.hostname !== 'localhost') hosts.push(u.hostname);
+  });
+  try {
+    const p = fresh.pages()[0] || (await fresh.newPage());
+    await p.goto(base);
+    await p.waitForFunction(() => navigator.serviceWorker && navigator.serviceWorker.controller !== null, null, { timeout: 15000 });
+    assert.equal(await p.evaluate(() => self.crossOriginIsolated), false);
+    // The asyncify build on the CPU lacks GatherBlockQuantized: the exact failure
+    // seen after a full 344 MB download before the check existed. So this also
+    // shows the check runs after the reload, before any download.
+    await p.evaluate(() => history.replaceState(null, '', '?device=wasm&build=asyncify'));
+    await Promise.all([p.waitForNavigation(), p.click('#btn-model')]);
+    assert.equal(await p.evaluate(() => self.crossOriginIsolated), true, 'the service worker made the page cross-origin isolated');
+    await p.waitForFunction(() => /cannot run it|ready|could not load/.test(document.querySelector('#model-v').textContent), null, { timeout: 60000 });
+    const mv = await p.textContent('#model-v');
+    assert.match(mv, /cannot run it/, mv);
+    assert.match(mv, /GatherBlockQuantized/, mv);
+    assert.match(mv, /Nothing was downloaded/, mv);
+    assert.doesNotMatch(await p.textContent('#foot-model'), /chosen by/);
+    assert.deepEqual(hosts, [], `external hosts: ${hosts.join(', ')}`);
+  } finally {
+    await fresh.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 await step('talks to nobody but Open-Meteo, and only when asked', async () => {
@@ -188,7 +211,7 @@ await step('no page errors', async () => {
 
 if (process.env.MODEL) {
   // The real model, in this browser: about 344 MB from the Hugging Face Hub.
-  const where = device === 'webgpu' ? /WebGPU/ : /CPU \(WebAssembly\)/;
+  const where = device === 'webgpu' ? /WebGPU/ : /CPU \(WebAssembly, /;
   await page.goto(`${base}?device=${device}`);
   const summary = [];
   const waitText = (sel, re, ms) => page.waitForFunction(
@@ -207,19 +230,42 @@ if (process.env.MODEL) {
     assert.match(mv, /ready/, mv);
     assert.match(mv, where, mv);
     assert.doesNotMatch(mv, /not saved/, mv);
-    assert.match(await page.textContent('#foot-model'), /written by Gemma/);
+    // The page came through the service worker, so it is isolated and the CPU
+    // path gets more than one thread.
+    assert.equal(await page.evaluate(() => self.crossOriginIsolated), true);
+    if (device === 'wasm') assert.match(mv, /WebAssembly, [2-9]\d* threads/, mv);
+    assert.match(await page.textContent('#foot-model'), /chosen by Gemma/);
     summary.push(`Loaded in the browser in ${((Date.now() - t) / 1000).toFixed(0)} s: ${mv}`);
   });
 
   const writePlan = async (label) => {
+    // Every text the source line shows, from the click to the end.
+    await page.evaluate(() => {
+      window.sourceLog = [];
+      new MutationObserver(() => window.sourceLog.push(document.querySelector('#o-source').textContent))
+        .observe(document.querySelector('#o-source'), { childList: true, characterData: true, subtree: true });
+    });
+    const t = Date.now();
     await page.click('#btn-plan');
+    // The built-in choice shows at once, while the model ranks.
+    await waitText('#o-source', /ranking our lists|ranked our lists|failed/, 5000);
+    const firstShown = (Date.now() - t) / 1000;
+    assert.ok((await page.locator('#o-bring li').count()) > 0, 'the built-in Bring list shows while the model ranks');
     await waitText('#o-source', /ranked our lists|failed/, 10 * 60000);
     const source = await page.textContent('#o-source');
     const raw = await page.textContent('#o-raw');
+    const log = await page.evaluate(() => window.sourceLog);
+    const steps = log.filter((x) => /ranking our lists.*\d+\/\d+/.test(x));
+    // One <li> per item: the code's must-bring items, then the model's top three.
+    const items = await page.locator('#o-bring li').allTextContents();
+    const top3 = raw.split('Notice:')[0].split('\n').slice(1, 4).map((x) => x.replace(/^[+-]\d+\.\d+\s+/, '').trim());
     summary.push(`${label}: ${source}`, `  ranking:\n${raw.replace(/^/gm, '    ')}`,
-      `  bring: ${await page.textContent('#o-bring')}`, `  notice: ${await page.textContent('#o-notice')}`);
+      `  bring (${items.length} items): ${items.join(' · ')}`, `  notice: ${await page.textContent('#o-notice')}`,
+      `  built-in choice shown after ${firstShown.toFixed(1)} s; progress shown ${steps.length} times, last: ${steps.length ? steps.at(-1).replace(/^.*device: /, '') : 'none'}`);
     assert.match(source, /ranked our lists/, source);
     assert.match(raw, /Bring:[\s\S]*Notice:/, 'the ranking is shown');
+    assert.ok(steps.length > 0, 'progress is shown while ranking');
+    assert.deepEqual(items.slice(-3), top3, 'Bring ends with the model\'s top three, each its own item');
   };
 
   await step('real model: ranks the lists and chooses Bring and Notice', async () => {
@@ -240,6 +286,42 @@ if (process.env.MODEL) {
     await writePlan('Offline');
     await context.setOffline(false);
   });
+
+  if (process.env.BENCH_RUNS) {
+    await step('real model: each plan timed, the old way and the app\'s way', async () => {
+      // The app page's worker holds a copy of the model; free it first.
+      await page.goto('about:blank');
+      const bench = await context.newPage();
+      await bench.goto(`${base}bench.html?device=${device}&runs=${encodeURIComponent(process.env.BENCH_RUNS)}`);
+      await bench.waitForFunction(() => window.bench && window.bench.done, null, { timeout: 40 * 60000, polling: 1000 });
+      const result = await bench.evaluate(() => window.bench);
+      await bench.close();
+      summary.push('', 'Each plan timed in this browser (a plan that has to work out its no-plan scores pays for those too):');
+      for (const r of result.rows || []) {
+        summary.push(`  ${r.secs.toFixed(1).padStart(6)} s  ${r.label} [${r.threads} thread${r.threads === 1 ? '' : 's'}]  ·  ${r.plan}  →  ${r.ranked.bring.slice(0, 3).map((x) => x.c).join(', ')} | ${r.ranked.notice[0].c}`);
+      }
+      assert.equal(result.error, undefined, result.error);
+      // Every pair of runs that ranked the same plan: how far apart are the scores?
+      const score = (r, list, c) => r.ranked[list].find((y) => y.c === c).score;
+      let maxDiff = 0;
+      const rows = result.rows;
+      for (let i = 0; i < rows.length; i += 1) {
+        for (let j = i + 1; j < rows.length; j += 1) {
+          if (rows[i].plan !== rows[j].plan) continue;
+          for (const list of ['bring', 'notice']) {
+            for (const x of rows[i].ranked[list]) maxDiff = Math.max(maxDiff, Math.abs(x.score - score(rows[j], list, x.c)));
+          }
+        }
+      }
+      summary.push(`  largest score difference between runs of the same plan: ${maxDiff.toExponential(1)}`);
+      if (device === 'webgpu') {
+        // Not used by the app on WebGPU; shown so the difference can be studied.
+        for (const r of rows) summary.push(`  ${r.label}: ${['bring', 'notice'].map((l) => r.ranked[l].map((x) => `${x.score.toFixed(3)} ${x.c}`).join('; ')).join(' || ')}`);
+      } else {
+        assert.ok(maxDiff <= 1e-3, `runs of the same plan disagree by ${maxDiff}`);
+      }
+    });
+  }
 
   const title = device === 'webgpu' ? 'WebGPU (SwiftShader, a software GPU: slow, but the same code path)' : 'the CPU (WebAssembly)';
   const text = ['', `## Gemma in headless Chromium, on ${title}`, '', '```', ...summary, '```', ''].join('\n');

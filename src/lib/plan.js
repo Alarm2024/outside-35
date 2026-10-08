@@ -139,6 +139,11 @@ export function noticeOptions({ activity, words, seasonName, part }) {
     .map((n) => n.text);
 }
 
+/** Every line any plan can rank, once each (for the model check). */
+export function allCandidates() {
+  return { bring: [...new Set(Object.values(OPTIONS).flat())], notice: NOTICES.map((n) => n.text) };
+}
+
 /** Without the model: one allowed line, the same all day. */
 export function fallbackNotice(date, options) {
   const day = Math.floor(date.valueOf() / 86400000);

@@ -24,9 +24,12 @@ function version() {
 await rm(dist, { recursive: true, force: true });
 await mkdir(path.join(dist, 'vendor', 'ort'), { recursive: true });
 
+// BENCH=1 adds the CI timing page (scripts/bench-page.js). The deployed site never has it.
+const bench = process.env.BENCH === '1';
+
 await build({
   // The model runs in its own worker (model-worker.js), off the page's main thread.
-  entryPoints: [path.join(src, 'app.js'), path.join(src, 'model-worker.js')],
+  entryPoints: [path.join(src, 'app.js'), path.join(src, 'model-worker.js'), ...(bench ? [path.join(root, 'scripts', 'bench-page.js')] : [])],
   bundle: true,
   format: 'esm',
   splitting: true,
@@ -44,6 +47,7 @@ for (const f of ['index.html', 'styles.css', 'manifest.webmanifest']) {
   await cp(path.join(src, f), path.join(dist, f));
 }
 await cp(path.join(src, 'icons'), path.join(dist, 'icons'), { recursive: true });
+if (bench) await cp(path.join(root, 'scripts', 'bench.html'), path.join(dist, 'bench.html'));
 // Two ~1 KB graphs with the model's quantized operators: the worker runs them
 // before the 344 MB download, so a browser that cannot run Gemma says so first.
 await mkdir(path.join(dist, 'ort-check'), { recursive: true });

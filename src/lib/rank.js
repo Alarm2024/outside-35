@@ -37,11 +37,20 @@ export function rankingQuestions(plan) {
  * @param {Float32Array} logits flat [length, vocab]
  */
 export function meanLogProb(logits, vocab, ids, from) {
+  return meanLogProbAt(logits, vocab, ids, from, 0);
+}
+
+/**
+ * The same, when the logits start at sequence position `first` (a run that
+ * reused a cache, or kept only its last rows): row r is position first + r.
+ */
+export function meanLogProbAt(logits, vocab, ids, from, first) {
   const start = Math.max(from, 1);
   if (start >= ids.length) return -Infinity;
+  if (start - 1 < first) throw new Error('the logits start after the first token to score');
   let sum = 0;
   for (let i = start; i < ids.length; i += 1) {
-    const row = logits.subarray((i - 1) * vocab, i * vocab);
+    const row = logits.subarray((i - 1 - first) * vocab, (i - first) * vocab);
     let max = -Infinity;
     for (let j = 0; j < vocab; j += 1) if (row[j] > max) max = row[j];
     let total = 0;
@@ -59,7 +68,10 @@ export function commonPrefixLength(a, b) {
 
 /**
  * Scores one answer to one question with a Transformers.js tokenizer and
- * causal language model (the same in the browser worker and in Node).
+ * causal language model (the same in the browser worker and in Node): one
+ * full run of the model per answer. The app uses rankShared below, which gives
+ * the same scores for a fraction of the work; this one stays as the reference
+ * the model check and the browser bench measure it against.
  */
 export function makeScorer(tokenizer, model) {
   const ids = (text) => Array.from(tokenizer(text, { add_special_tokens: false }).input_ids.data, Number);
@@ -80,14 +92,119 @@ export function makeScorer(tokenizer, model) {
  * plain likelihood one Notice line won five of six test plans; this way the
  * choice follows the plan.)
  */
-export async function rank(score, { question, neutral, answer }, candidates, baselines = new Map()) {
+export async function rank(score, { question, neutral, answer }, candidates, baselines = new Map(), onScored = () => {}) {
   const out = [];
   for (const c of candidates) {
     const a = answer(c);
     // The no-plan score never changes, so it is worked out once per answer.
     const key = `${neutral}\n${a.prefix}${a.text}`;
-    if (!baselines.has(key)) baselines.set(key, await score(neutral, a));
+    if (!baselines.has(key)) {
+      baselines.set(key, await score(neutral, a));
+      onScored();
+    }
     out.push({ c, score: (await score(question, a)) - baselines.get(key) });
+    onScored();
   }
   return out.sort((x, y) => y.score - x.score);
+}
+
+/**
+ * The model as rankShared needs it: token ids in, logits for the last `keep`
+ * positions out, optionally continuing from a cache of earlier positions
+ * (Transformers.js past_key_values). The same in the browser worker and in Node.
+ * @param {typeof import('@huggingface/transformers').Tensor} Tensor
+ */
+export function makeLM(tokenizer, model, Tensor) {
+  const int64 = (values, dims) => new Tensor('int64', BigInt64Array.from(values, BigInt), dims);
+  return {
+    encode: (text) => Array.from(tokenizer(text, { add_special_tokens: false }).input_ids.data, Number),
+    prompt: (question) => tokenizer.apply_chat_template([{ role: 'user', content: question }], { tokenize: false, add_generation_prompt: true }),
+    async run(ids, cache, keep) {
+      const length = (cache ? cache.length : 0) + ids.length;
+      const out = await model({
+        input_ids: int64(ids, [1, ids.length]),
+        attention_mask: int64(new Array(length).fill(1), [1, length]),
+        ...(cache ? { past_key_values: cache.tensors } : {}),
+        // Only models exported with this input use it; others return every row.
+        num_logits_to_keep: int64([keep], []),
+      });
+      const tensors = {};
+      for (const name of Object.keys(out)) {
+        if (name.startsWith('present')) tensors[name.replace('present', 'past_key_values')] = out[name];
+      }
+      return {
+        logits: out.logits,
+        cache: { length, tensors },
+        // On WebGPU the cache lives in GPU buffers, which are freed only by hand.
+        dispose: () => { for (const t of Object.values(tensors)) t.dispose(); },
+      };
+    },
+  };
+}
+
+/**
+ * Mean log-probability of each answer to one question. The prompt is the
+ * same for every answer, so the model reads it once and keeps its cache;
+ * each answer then costs only its own few tokens, with logits only where
+ * they are read. Same scores as makeScorer, a fraction of the work.
+ * @param {(n: number) => void} onScored called after each answer
+ */
+export async function scoreShared(lm, question, answers, onScored = () => {}) {
+  if (!answers.length) return [];
+  const prompt = lm.prompt(question);
+  const heads = new Map();
+  const items = answers.map((a) => {
+    const head = prompt + a.prefix;
+    if (!heads.has(head)) heads.set(head, lm.encode(head));
+    const ids = lm.encode(head + a.text);
+    // The answer starts where its tokens leave the question's (a space before
+    // the answer can merge into its first token).
+    return { ids, from: commonPrefixLength(heads.get(head), ids) };
+  });
+  // The shared tokens end before the first token any answer is scored on, so
+  // each answer's own run includes the row that predicts its first token.
+  let shared = Math.min(...items.map((x) => x.from)) - 1;
+  for (const x of items) shared = Math.min(shared, commonPrefixLength(items[0].ids, x.ids));
+  const head = shared >= 1 ? await lm.run(items[0].ids.slice(0, shared), null, 1) : null;
+  try {
+    const scores = [];
+    for (const x of items) {
+      const start = head ? shared : 0;
+      // Rows from the one before the answer's first token to the end.
+      const keep = Math.min(x.ids.length - x.from + 1, x.ids.length - start);
+      const run = await lm.run(x.ids.slice(start), head && head.cache, keep);
+      try {
+        const [, rows, vocab] = run.logits.dims;
+        scores.push(meanLogProbAt(run.logits.data, vocab, x.ids, x.from, x.ids.length - rows));
+      } finally {
+        run.dispose();
+      }
+      onScored(scores.length);
+    }
+    return scores;
+  } finally {
+    if (head) head.dispose();
+  }
+}
+
+/** How many answers rankShared will score for one question (the progress total). */
+export function rankSteps({ neutral, answer }, candidates, baselines) {
+  const missing = candidates.filter((c) => {
+    const a = answer(c);
+    return !baselines.has(`${neutral}\n${a.prefix}${a.text}`);
+  });
+  return candidates.length + missing.length;
+}
+
+/** rank, with scoreShared: the no-plan scores first (once per answer), then this plan's. */
+export async function rankShared(lm, { question, neutral, answer }, candidates, baselines = new Map(), onScored = () => {}) {
+  const answers = candidates.map(answer);
+  const keys = answers.map((a) => `${neutral}\n${a.prefix}${a.text}`);
+  const missing = answers.filter((_, i) => !baselines.has(keys[i]));
+  if (missing.length) {
+    const s = await scoreShared(lm, neutral, missing, onScored);
+    missing.forEach((a, i) => baselines.set(`${neutral}\n${a.prefix}${a.text}`, s[i]));
+  }
+  const scores = await scoreShared(lm, question, answers, onScored);
+  return candidates.map((c, i) => ({ c, score: scores[i] - baselines.get(keys[i]) })).sort((x, y) => y.score - x.score);
 }

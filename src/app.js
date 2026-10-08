@@ -105,7 +105,7 @@ function renderModel() {
     v.replaceChildren(`${MODEL.name}: loading… ${Math.round(m.progress)}%`);
     bar.value = m.progress;
   } else if (m.status === 'ready') {
-    const where = m.device === 'webgpu' ? 'your GPU (WebGPU)' : 'your CPU (WebAssembly)';
+    const where = m.device === 'webgpu' ? 'your GPU (WebGPU)' : `your CPU (WebAssembly, ${m.threads === 1 ? '1 thread' : `${m.threads} threads`})`;
     v.replaceChildren(el('span', `${MODEL.name}: ready`, 'ok'), ` · running on ${where}`);
     if (m.fellBack) v.append(' (WebGPU did not work on this device, so it uses the CPU)');
     if (m.saved === false) v.append(' · not saved for use with no signal: this browser did not allow the storage, so it will download again next time');
@@ -118,7 +118,7 @@ function renderModel() {
   }
   // Only claim the model wrote anything when it is actually loaded.
   $('foot-model').textContent = m.status === 'ready'
-    ? `Bring picks and Notice are written by ${MODEL.name}, an open-weight model, on your device, then checked by code. Times and weather come from code and data, never from the model.`
+    ? `Bring picks and Notice are chosen by ${MODEL.name}, an open-weight model, on your device, from lines we wrote and your data allows. Times and weather come from code and data, never from the model.`
     : 'Bring and Notice are built-in text until you load the model. Times and weather come from code and data, never from a model.';
 }
 
@@ -202,12 +202,39 @@ async function checkWeather() {
   }
 }
 
+// The service worker makes pages it serves cross-origin isolated, so the model
+// can use more than one CPU thread. The first visit is served before it runs:
+// the model button reloads that page once, and loading carries on by itself.
+const RELOAD_KEY = 'o35:reload-for-threads';
+function reloadedForThreads() {
+  try {
+    if (sessionStorage.getItem(RELOAD_KEY) !== 'reloading') return false;
+    sessionStorage.setItem(RELOAD_KEY, 'done');
+    return true;
+  } catch {
+    return false;
+  }
+}
+function reloadForThreads() {
+  try {
+    // Only once: a browser that ignores the headers just runs on one thread.
+    if (self.crossOriginIsolated || !navigator.serviceWorker || !navigator.serviceWorker.controller) return false;
+    if (sessionStorage.getItem(RELOAD_KEY)) return false;
+    sessionStorage.setItem(RELOAD_KEY, 'reloading');
+  } catch {
+    return false;
+  }
+  location.reload();
+  return true;
+}
+
 async function loadModel() {
+  if (reloadForThreads()) return;
   state.model = { ...state.model, status: 'loading', progress: 0, error: null, stage: null };
   renderModel();
   try {
     modelModule = modelModule || (await import('./model.js'));
-    const { device, fellBack } = await modelModule.loadModel(
+    const { device, fellBack, threads } = await modelModule.loadModel(
       (p) => {
         if (typeof p.progress === 'number') {
           state.model.progress = p.progress;
@@ -221,7 +248,7 @@ async function loadModel() {
     );
     // Say so if the browser would not keep the weights: then it is not offline-ready.
     const saved = await modelIsCached();
-    state.model = { status: 'ready', device, fellBack, saved, error: null, progress: 100, stage: null };
+    state.model = { status: 'ready', device, fellBack, threads, saved, error: null, progress: 100, stage: null };
   } catch (err) {
     console.error(err);
     const message = err && err.message ? err.message.slice(0, 160) : 'unknown error';
@@ -312,32 +339,38 @@ async function makePlan() {
   ].join('\n');
   $('o-raw-wrap').hidden = true;
 
-  let bring = fallbackBring(state.activity, words);
-  let notice = fallbackNotice(now, notices);
-  let source = `${MODEL.name} is not loaded, so this is the built-in choice. Load the model to have it choose on your device.`;
+  // The built-in choice shows at once; the model's choice replaces it when ready.
+  const show = (bring, notice, source) => {
+    $('o-bring').replaceChildren(...bring.map((b) => el('li', b)));
+    $('o-notice').textContent = notice;
+    $('o-source').textContent = source;
+  };
+  const builtIn = [fallbackBring(state.activity, words), fallbackNotice(now, notices)];
+  show(...builtIn, `${MODEL.name} is not loaded, so this is the built-in choice. Load the model to have it choose on your device.`);
+  $('out').scrollIntoView({ behavior: 'smooth', block: 'start' });
 
   if (state.model.status === 'ready') {
-    $('o-source').textContent = `${MODEL.name} is choosing on your device…`;
+    const ranking = (done, total) => `Built-in choice for now. ${MODEL.name} is ranking our lists for this plan on your device${total ? `: ${done}/${total}` : ''}…`;
+    $('o-source').textContent = ranking(0, 0);
     try {
       const t0 = performance.now();
-      const ranked = await modelModule.rankPlan(plan, options.optional, notices);
+      const ranked = await modelModule.rankPlan(plan, options.optional, notices, ({ done, total }) => {
+        $('o-source').textContent = ranking(done, total);
+      });
       const secs = ((performance.now() - t0) / 1000).toFixed(1);
-      bring = [...options.required.map(requiredLabel), ...ranked.bring.slice(0, 3).map((r) => r.c)];
-      notice = ranked.notice[0].c;
-      source = `${MODEL.name} ranked our lists for this plan on your device in ${secs} s and chose the three things to bring and the thing to notice. It can only choose lines we wrote and your data allows, so it cannot invent a fact.`;
+      show(
+        [...options.required.map(requiredLabel), ...ranked.bring.slice(0, 3).map((r) => r.c)],
+        ranked.notice[0].c,
+        `${MODEL.name} ranked our lists for this plan on your device in ${secs} s and chose the three things to bring and the thing to notice. It can only choose lines we wrote and your data allows, so it cannot invent a fact.`,
+      );
       const line = (r) => `${r.score >= 0 ? '+' : ''}${r.score.toFixed(2)}  ${r.c}`;
       $('o-raw').textContent = ['Bring:', ...ranked.bring.map(line), '', 'Notice:', ...ranked.notice.map(line)].join('\n');
       $('o-raw-wrap').hidden = false;
     } catch (err) {
-      source = `${MODEL.name} failed (${err.message}). Showing the built-in choice instead.`;
+      show(...builtIn, `${MODEL.name} failed (${err.message}). Showing the built-in choice instead.`);
     }
   }
-
-  $('o-bring').replaceChildren(...bring.map((b) => el('li', b)));
-  $('o-notice').textContent = notice;
-  $('o-source').textContent = source;
   btn.disabled = false;
-  $('out').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 // ── Wire up ──────────────────────────────────────────────────────────────
@@ -357,12 +390,16 @@ window.addEventListener('online', renderWeather);
 window.addEventListener('offline', renderWeather);
 
 renderAll();
-modelIsCached().then((cached) => {
-  if (cached && state.model.status === 'idle') {
-    state.model.status = 'cached';
-    renderModel();
-  }
-});
+if (reloadedForThreads()) {
+  loadModel();
+} else {
+  modelIsCached().then((cached) => {
+    if (cached && state.model.status === 'idle') {
+      state.model.status = 'cached';
+      renderModel();
+    }
+  });
+}
 
 const secure = location.protocol === 'https:' || ['localhost', '127.0.0.1'].includes(location.hostname);
 if ('serviceWorker' in navigator && secure) {
