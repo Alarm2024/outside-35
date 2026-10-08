@@ -132,6 +132,19 @@ for (const keepSupported of [true, false]) {
   });
 }
 
+test('with the prompt run on its own (WebGPU), the same scores, one run more', async () => {
+  const lm = fakeLM();
+  const question = 'I am going out for a hike on a cold, rain likely day in the morning in winter. What is one small thing I could notice outside?';
+  const expected = [];
+  for (const a of NOTICES) expected.push(await lm.full(question, a));
+  lm.stats.runs = 0;
+  const steps = [];
+  assert.deepEqual(await scoreShared(lm, question, NOTICES, (n) => steps.push(n), { promptInFirstAnswer: false }), expected);
+  assert.equal(lm.stats.runs, NOTICES.length + 1);
+  assert.deepEqual(steps, [1, 2]);
+  assert.equal(lm.stats.open, 0, 'the prompt\'s cache is released too');
+});
+
 test('the answer\'s first token is scored even when the space before it merges into it', async () => {
   const lm = fakeLM();
   const head = lm.encode(`${lm.prompt('Q?')}Bring `);

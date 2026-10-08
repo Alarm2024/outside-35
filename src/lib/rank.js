@@ -161,14 +161,16 @@ export function makeLM(tokenizer, model, Tensor) {
  * full run per answer) for a fraction of the work.
  *
  * In the browser's CPU build each model call costs about a second whatever
- * its length, so the number of calls is what counts: the shortest answer runs
- * whole, and the start of its cache, which is exactly the prompt's (the model
- * is causal), serves every other answer. One call per answer, none extra.
- * (They cannot share calls: this model's attention, GroupQueryAttention, runs
- * several new tokens on top of a cache only one row at a time.)
+ * its length, so the number of calls is what counts: with promptInFirstAnswer
+ * the shortest answer runs whole, and the start of its cache, which is
+ * exactly the prompt's (the model is causal), serves every other answer. One
+ * call per answer, none extra. That needs the cache in CPU memory; on WebGPU
+ * the prompt runs on its own first. (Answers cannot share a call: this
+ * model's attention, GroupQueryAttention, runs several new tokens on top of a
+ * cache only one row at a time.)
  * @param {(n: number) => void} onScored called after each answer
  */
-export async function scoreShared(lm, question, answers, onScored = () => {}) {
+export async function scoreShared(lm, question, answers, onScored = () => {}, { promptInFirstAnswer = true } = {}) {
   if (!answers.length) return [];
   const prompt = lm.prompt(question);
   const heads = new Map();
@@ -197,23 +199,35 @@ export async function scoreShared(lm, question, answers, onScored = () => {}) {
   // Rows from the one before the answer's first token to the end.
   const keep = (x, start) => Math.min(x.ids.length - x.from + 1, x.ids.length - start);
 
-  const first = items[order[0]];
-  const whole = await lm.run(first.ids, null, keep(first, 0));
   let cache = null;
-  try {
-    score(order[0], whole);
-    if (items.length > 1 && shared >= 1) cache = lm.prefix(whole.cache, shared);
-  } finally {
-    whole.dispose();
-  }
-  const start = cache ? shared : 0;
-  for (const i of order.slice(1)) {
-    const run = await lm.run(items[i].ids.slice(start), cache, keep(items[i], start));
+  let head = null;
+  let rest = order;
+  if (promptInFirstAnswer) {
+    const first = items[order[0]];
+    const whole = await lm.run(first.ids, null, keep(first, 0));
     try {
-      score(i, run);
+      score(order[0], whole);
+      if (items.length > 1 && shared >= 1) cache = lm.prefix(whole.cache, shared);
     } finally {
-      run.dispose();
+      whole.dispose();
     }
+    rest = order.slice(1);
+  } else if (shared >= 1) {
+    head = await lm.run(items[0].ids.slice(0, shared), null, 1);
+    cache = head.cache;
+  }
+  try {
+    const start = cache ? shared : 0;
+    for (const i of rest) {
+      const run = await lm.run(items[i].ids.slice(start), cache, keep(items[i], start));
+      try {
+        score(i, run);
+      } finally {
+        run.dispose();
+      }
+    }
+  } finally {
+    if (head) head.dispose();
   }
   return scores;
 }
@@ -228,14 +242,14 @@ export function rankSteps({ neutral, answer }, candidates, baselines) {
 }
 
 /** rank, with scoreShared: the no-plan scores first (once per answer), then this plan's. */
-export async function rankShared(lm, { question, neutral, answer }, candidates, baselines = new Map(), onScored = () => {}) {
+export async function rankShared(lm, { question, neutral, answer }, candidates, baselines = new Map(), onScored = () => {}, options = {}) {
   const answers = candidates.map(answer);
   const keys = answers.map((a) => `${neutral}\n${a.prefix}${a.text}`);
   const missing = answers.filter((_, i) => !baselines.has(keys[i]));
   if (missing.length) {
-    const s = await scoreShared(lm, neutral, missing, onScored);
+    const s = await scoreShared(lm, neutral, missing, onScored, options);
     missing.forEach((a, i) => baselines.set(`${neutral}\n${a.prefix}${a.text}`, s[i]));
   }
-  const scores = await scoreShared(lm, question, answers, onScored);
+  const scores = await scoreShared(lm, question, answers, onScored, options);
   return candidates.map((c, i) => ({ c, score: scores[i] - baselines.get(keys[i]) })).sort((x, y) => y.score - x.score);
 }

@@ -93,22 +93,36 @@ async function load(id) {
  * Ranks this plan's Bring and Notice candidates, best first, reporting each
  * answer scored so the page can show progress.
  *
- * On the CPU each question's prompt runs once and its cache is reused, with
- * the answers run together (rankShared): measured in CI, the same scores as
- * one full run per answer.
- * On WebGPU that is not so (in CI, on a software GPU, scores differed by up
- * to 0.63), so WebGPU keeps one full run per answer. mode overrides this, for
- * the bench.
+ * Each question's prompt is read once and its cache reused (rankShared):
+ * measured in CI, the same scores as one full run per answer on the CPU. On
+ * the CPU the prompt is read inside the shortest answer's run, one call fewer;
+ * on WebGPU it runs on its own, because cutting a cache needs it in CPU
+ * memory. On WebGPU (a software GPU in CI) these scores matched the CPU's to
+ * 0.001, and one full run per answer did not (up to 0.53 apart), so WebGPU
+ * no longer uses that. mode 'full' keeps it for the bench; timings returns
+ * how long each model call took.
  */
-async function rankPlan({ id, plan, bring, notice, mode = device === 'wasm' ? 'shared' : 'full' }) {
+async function rankPlan({ id, plan, bring, notice, mode = 'shared', timings = false }) {
   const q = rankingQuestions(plan);
   const total = rankSteps(q.bring, bring, baselines) + rankSteps(q.notice, notice, baselines);
   let done = 0;
   const onScored = () => self.postMessage({ id, type: 'progress', done: (done += 1), total });
+  const calls = [];
+  const timed = !timings ? lm : {
+    ...lm,
+    async run(ids, cache, keep) {
+      const t = performance.now();
+      const out = await lm.run(ids, cache, keep);
+      calls.push({ tokens: ids.length, cached: cache ? cache.length : 0, ms: Math.round(performance.now() - t) });
+      return out;
+    },
+  };
+  const options = { promptInFirstAnswer: device === 'wasm' };
   const rankOne = mode === 'full'
     ? (question, candidates) => rank(score, question, candidates, baselines, onScored)
-    : (question, candidates) => rankShared(lm, question, candidates, baselines, onScored);
-  return { bring: await rankOne(q.bring, bring), notice: await rankOne(q.notice, notice) };
+    : (question, candidates) => rankShared(timed, question, candidates, baselines, onScored, options);
+  const ranked = { bring: await rankOne(q.bring, bring), notice: await rankOne(q.notice, notice) };
+  return timings ? { ...ranked, calls } : ranked;
 }
 
 self.onmessage = async ({ data }) => {

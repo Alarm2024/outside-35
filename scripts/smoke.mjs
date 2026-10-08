@@ -9,7 +9,7 @@
 //                                             # + times each plan both ways (scripts/bench-page.js)
 import { chromium } from 'playwright-core';
 import http from 'node:http';
-import { readFile, stat, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, stat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -299,6 +299,10 @@ if (process.env.MODEL) {
       summary.push('', 'Each plan timed in this browser (a plan that has to work out its no-plan scores pays for those too):');
       for (const r of result.rows || []) {
         summary.push(`  ${r.secs.toFixed(1).padStart(6)} s  ${r.label} [${r.threads} thread${r.threads === 1 ? '' : 's'}]  ·  ${r.plan}  →  ${r.ranked.bring.slice(0, 3).map((x) => x.c).join(', ')} | ${r.ranked.notice[0].c}`);
+        if (r.ranked.calls) {
+          const ms = r.ranked.calls.reduce((t, c) => t + c.ms, 0);
+          summary.push(`           ${r.ranked.calls.length} model calls, ${(ms / 1000).toFixed(1)} s (tokens+cached: ms) ${r.ranked.calls.map((c) => `${c.tokens}+${c.cached}:${c.ms}`).join(' ')}; the other ${(r.secs - ms / 1000).toFixed(1)} s is scoring and messages`);
+        }
       }
       assert.equal(result.error, undefined, result.error);
       // Every pair of runs that ranked the same plan: how far apart are the scores?
@@ -321,9 +325,28 @@ if (process.env.MODEL) {
       const scores = (r) => ['bring', 'notice'].map((l) => r.ranked[l].map((x) => `${x.score.toFixed(3)} ${x.c}`).join('; ')).join(' || ');
       const shown = device === 'webgpu' ? rows : rows.filter((r) => r.plan === 'a short walk').slice(0, 1);
       for (const r of shown) summary.push(`  scores, ${r.plan}, ${r.label}: ${scores(r)}`);
-      // On WebGPU the app keeps one run per answer; the prompt-once run there is
-      // a study of why they differ, not something the app relies on.
-      if (device !== 'webgpu') assert.ok(maxDiff <= 1e-3, `runs of the same plan disagree by ${maxDiff}`);
+      // The CPU's scores for one plan, kept for the WebGPU run in the same job:
+      // the app's WebGPU scores must match them.
+      const scoresFile = path.join(root, 'model-check-scores.json');
+      const app = rows.find((r) => r.plan === 'a short walk' && r.mode === 'shared');
+      if (device === 'wasm') {
+        // On the CPU every way of ranking a plan must give the same scores.
+        assert.ok(maxDiff <= 1e-3, `runs of the same plan disagree by ${maxDiff}`);
+        if (app) await writeFile(scoresFile, JSON.stringify(app.ranked));
+      } else if (app) {
+        // One full run per answer is shown for comparison only: it does not match the CPU here.
+        const cpu = await readFile(scoresFile, 'utf8').then(JSON.parse).catch(() => null);
+        if (cpu) {
+          let gap = 0;
+          for (const list of ['bring', 'notice']) {
+            for (const x of app.ranked[list]) gap = Math.max(gap, Math.abs(x.score - cpu[list].find((y) => y.c === x.c).score));
+          }
+          summary.push(`  the app on WebGPU against the CPU, same plan: largest score difference ${gap.toFixed(4)}`);
+          assert.ok(gap <= 0.02, `the app's WebGPU scores differ from the CPU's by ${gap}`);
+        } else {
+          summary.push('  (no CPU scores from this job to compare with)');
+        }
+      }
     });
   }
 
