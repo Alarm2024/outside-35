@@ -325,26 +325,30 @@ if (process.env.MODEL) {
       const scores = (r) => ['bring', 'notice'].map((l) => r.ranked[l].map((x) => `${x.score.toFixed(3)} ${x.c}`).join('; ')).join(' || ');
       const shown = device === 'webgpu' ? rows : rows.filter((r) => r.plan === 'a short walk').slice(0, 1);
       for (const r of shown) summary.push(`  scores, ${r.plan}, ${r.label}: ${scores(r)}`);
-      // The CPU's scores for one plan, kept for the WebGPU run in the same job:
-      // the app's WebGPU scores must match them.
+      // The app's scores for every plan the CPU ranked, kept for the WebGPU run
+      // in the same job: the app's WebGPU scores for each plan must match them.
       const scoresFile = path.join(root, 'model-check-scores.json');
-      const app = rows.find((r) => r.plan === 'a short walk' && r.mode === 'shared');
+      const app = {};
+      for (const r of rows) if (r.mode === 'shared' && !app[r.plan]) app[r.plan] = r.ranked;
       if (device === 'wasm') {
         // On the CPU every way of ranking a plan must give the same scores.
         assert.ok(maxDiff <= 1e-3, `runs of the same plan disagree by ${maxDiff}`);
-        if (app) await writeFile(scoresFile, JSON.stringify(app.ranked));
-      } else if (app) {
+        await writeFile(scoresFile, JSON.stringify(app));
+      } else {
         // One full run per answer is shown for comparison only: it does not match the CPU here.
         const cpu = await readFile(scoresFile, 'utf8').then(JSON.parse).catch(() => null);
-        if (cpu) {
+        const plans = Object.keys(app).filter((plan) => cpu && cpu[plan]);
+        if (!plans.length) summary.push('  (no CPU scores from this job to compare with)');
+        for (const plan of plans) {
           let gap = 0;
           for (const list of ['bring', 'notice']) {
-            for (const x of app.ranked[list]) gap = Math.max(gap, Math.abs(x.score - cpu[list].find((y) => y.c === x.c).score));
+            for (const x of app[plan][list]) {
+              const y = cpu[plan][list].find((z) => z.c === x.c);
+              if (y) gap = Math.max(gap, Math.abs(x.score - y.score));
+            }
           }
-          summary.push(`  the app on WebGPU against the CPU, same plan: largest score difference ${gap.toFixed(4)}`);
-          assert.ok(gap <= 0.02, `the app's WebGPU scores differ from the CPU's by ${gap}`);
-        } else {
-          summary.push('  (no CPU scores from this job to compare with)');
+          summary.push(`  the app on WebGPU against the CPU, ${plan}: largest score difference ${gap.toFixed(4)}`);
+          assert.ok(gap <= 0.02, `the app's WebGPU scores for "${plan}" differ from the CPU's by ${gap}`);
         }
       }
     });

@@ -168,9 +168,14 @@ export function makeLM(tokenizer, model, Tensor) {
  * the prompt runs on its own first. (Answers cannot share a call: this
  * model's attention, GroupQueryAttention, runs several new tokens on top of a
  * cache only one row at a time.)
+ *
+ * maxRun caps the new tokens in one model call: a longer run is read in
+ * pieces, each continuing from the cache of the one before. (On WebGPU,
+ * measured in CI: every call of 32 or more new tokens gave other scores than
+ * the CPU, every call of up to 27 the same.)
  * @param {(n: number) => void} onScored called after each answer
  */
-export async function scoreShared(lm, question, answers, onScored = () => {}, { promptInFirstAnswer = true } = {}) {
+export async function scoreShared(lm, question, answers, onScored = () => {}, { promptInFirstAnswer = true, maxRun = 0 } = {}) {
   if (!answers.length) return [];
   const prompt = lm.prompt(question);
   const heads = new Map();
@@ -199,12 +204,13 @@ export async function scoreShared(lm, question, answers, onScored = () => {}, { 
   // Rows from the one before the answer's first token to the end.
   const keep = (x, start) => Math.min(x.ids.length - x.from + 1, x.ids.length - start);
 
+  const run = (ids, from, rows) => runInPieces(lm, ids, from, rows, maxRun);
   let cache = null;
   let head = null;
   let rest = order;
   if (promptInFirstAnswer) {
     const first = items[order[0]];
-    const whole = await lm.run(first.ids, null, keep(first, 0));
+    const whole = await run(first.ids, null, keep(first, 0));
     try {
       score(order[0], whole);
       if (items.length > 1 && shared >= 1) cache = lm.prefix(whole.cache, shared);
@@ -213,23 +219,42 @@ export async function scoreShared(lm, question, answers, onScored = () => {}, { 
     }
     rest = order.slice(1);
   } else if (shared >= 1) {
-    head = await lm.run(items[0].ids.slice(0, shared), null, 1);
+    head = await run(items[0].ids.slice(0, shared), null, 1);
     cache = head.cache;
   }
   try {
     const start = cache ? shared : 0;
     for (const i of rest) {
-      const run = await lm.run(items[i].ids.slice(start), cache, keep(items[i], start));
+      const answer = await run(items[i].ids.slice(start), cache, keep(items[i], start));
       try {
-        score(i, run);
+        score(i, answer);
       } finally {
-        run.dispose();
+        answer.dispose();
       }
     }
   } finally {
     if (head) head.dispose();
   }
   return scores;
+}
+
+/**
+ * lm.run, in pieces of at most max new tokens (0: no limit). The last piece
+ * holds the rows to keep, so it is longer when more rows are kept than max;
+ * each earlier piece's cache is released once the next piece has read it.
+ */
+export async function runInPieces(lm, ids, cache, keep, max) {
+  if (!max || ids.length <= max) return lm.run(ids, cache, keep);
+  const cuts = [ids.length - Math.min(ids.length, Math.max(max, keep))];
+  for (let end = cuts[0]; end > 0; end -= max) cuts.unshift(Math.max(0, end - max));
+  let last = null;
+  for (let k = 0; k < cuts.length; k += 1) {
+    const end = k + 1 < cuts.length ? cuts[k + 1] : ids.length;
+    const next = await lm.run(ids.slice(cuts[k], end), last ? last.cache : cache, end === ids.length ? keep : 1);
+    if (last) last.dispose();
+    last = next;
+  }
+  return last;
 }
 
 /** How many answers rankShared will score for one question (the progress total). */

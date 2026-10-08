@@ -97,10 +97,12 @@ async function load(id) {
  * measured in CI, the same scores as one full run per answer on the CPU. On
  * the CPU the prompt is read inside the shortest answer's run, one call fewer;
  * on WebGPU it runs on its own, because cutting a cache needs it in CPU
- * memory. On WebGPU (a software GPU in CI) these scores matched the CPU's to
- * 0.001, and one full run per answer did not (up to 0.53 apart), so WebGPU
- * no longer uses that. mode 'full' keeps it for the bench; timings returns
- * how long each model call took.
+ * memory. On WebGPU (a software GPU in CI) every model call of 32 or more
+ * new tokens gave other scores than the CPU (one full run per answer up to
+ * 0.53 apart, and a long plan's prompt too), and every call of up to 27 the
+ * same; so on WebGPU no call reads more than 16 new tokens at once (a long
+ * prompt is read in pieces). mode 'full' keeps one full run per answer for
+ * the bench; timings returns how long each model call took.
  */
 async function rankPlan({ id, plan, bring, notice, mode = 'shared', timings = false }) {
   const q = rankingQuestions(plan);
@@ -117,7 +119,7 @@ async function rankPlan({ id, plan, bring, notice, mode = 'shared', timings = fa
       return out;
     },
   };
-  const options = { promptInFirstAnswer: device === 'wasm' };
+  const options = { promptInFirstAnswer: device === 'wasm', maxRun: device === 'wasm' ? 0 : 16 };
   const rankOne = mode === 'full'
     ? (question, candidates) => rank(score, question, candidates, baselines, onScored)
     : (question, candidates) => rankShared(timed, question, candidates, baselines, onScored, options);

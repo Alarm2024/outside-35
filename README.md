@@ -58,7 +58,7 @@ The model chooses; code decides what it may choose from and works out every numb
   - Slower runner: 57.9 → 10.6 s and 59.3 → 10.7 s; the six plans took 9.2–10.7 s.
   - On one thread (a browser that does not allow isolation): 9.4–10.5 s on the faster runner, 17.3–19.8 s on the slower one.
   - Real phones are not measured yet.
-- **WebGPU** reads the prompt once too, as its own call, because cutting a cache needs it in CPU memory. In CI, on a software GPU, one full run per answer disagreed with the CPU by up to 0.53; this way matches it to 0.001. The Model check fails if they drift apart.
+- **WebGPU** reads the prompt once too, on its own, because cutting a cache needs it in CPU memory. In CI, on a software GPU, every model call of 32 or more new tokens gave other scores than the CPU (one full run per answer was up to 0.53 apart, and so was a long plan's prompt read in one call), and every call of up to 27 new tokens gave the same. So on WebGPU no call reads more than 16 new tokens: a long prompt is read in pieces, each continuing from the one before. The Model check compares the app's WebGPU scores with the CPU's for a short plan and a long one.
 - **Two runtime builds, on purpose.** The q4 file uses a quantized operator (`GatherBlockQuantized`) that ONNX Runtime's WebGPU-capable build runs only on the GPU. So WebGPU devices use that build, and every other device uses the plain build, which runs it on the CPU. If WebGPU fails on a device, the app starts a fresh worker on the CPU and remembers that, with no second download.
 - **Checked before the download.** Before fetching 344 MB, the worker runs two tiny graphs (about 1 KB each) holding the model's quantized operators. If this browser cannot run them, it says so and downloads nothing. `npm run probe-ort` runs the same check on both builds in CI.
 - **No server inference, no closed-model API, no account.** The page makes only two kinds of outside requests, and only when you tap for them: the model files from Hugging Face (**Download**), and the forecast for your rounded position from Open-Meteo (**Check weather**).
@@ -79,7 +79,7 @@ It is a PWA. After the first visit, the app works with no signal. The model work
 - `npm run probe-ort`: the shipped ONNX Runtime builds against the model's quantized operators, on the CPU and on WebGPU (SwiftShader, a software GPU, so no graphics card is needed).
 - **Model check** (GitHub Actions, `model-check.yml`): loads the real Gemma 3 270M IT (q4) with the app's own ranking code and option lists, and writes what it chose for each test plan to the job summary. It fails if the choices do not change with the plan. It does this in Node, then in headless Chromium on the CPU and on WebGPU, each time making a plan, reloading with no signal, loading the model again from the browser cache and making another plan. It also:
   - times each plan the old way (one full run per answer) and the app's way, on the CPU with and without threads, and fails if two ways of ranking the same plan on the CPU differ by more than 0.001;
-  - fails if the shipped no-plan scores are out of date, or if the app's WebGPU scores differ from the CPU's for the same plan by more than 0.02.
+  - fails if the shipped no-plan scores are out of date, or if the app's WebGPU scores differ from the CPU's by more than 0.02 for any plan both ranked (a short plan, and a long one whose prompt is read in pieces).
 - **Not tested automatically:** real phones and real GPUs. The WebGPU run uses a software GPU.
 
 ## Run it yourself

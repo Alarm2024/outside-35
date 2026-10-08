@@ -95,7 +95,7 @@ jobs:
         env:
           MODEL: '1'
           MODEL_DEVICE: webgpu
-          BENCH_RUNS: '[{"label": "before: one full run per answer (main)", "mode": "full", "from": 3, "n": 1}, {"label": "after: the app on WebGPU (prompt read once, on its own)", "mode": "shared", "from": 3, "n": 1, "timings": true}]'
+          BENCH_RUNS: '[{"label": "before: one full run per answer (main)", "mode": "full", "from": 3, "n": 1}, {"label": "after: the app on WebGPU (prompt read once, on its own, at most 16 new tokens per call)", "mode": "shared", "from": 3, "n": 1, "timings": true}, {"label": "after: the app on WebGPU, a long prompt (read in pieces)", "mode": "shared", "from": 0, "n": 1, "shipped": true, "timings": true}]'
         run: npm run smoke
       - uses: actions/upload-artifact@v4
         if: always()
