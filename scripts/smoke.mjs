@@ -5,6 +5,8 @@
 //   npm run build && npm run smoke            # SCREENSHOT=1 also writes docs/screenshot.png
 //   MODEL=1 npm run smoke                     # + the real model on the CPU (344 MB download)
 //   MODEL=1 MODEL_DEVICE=webgpu npm run smoke # + the real model on WebGPU (SwiftShader, no GPU needed)
+//   BENCH_RUNS=full:2,shared:6 (with MODEL=1, after BENCH=1 npm run build)
+//                                             # + times each plan both ways (scripts/bench-page.js)
 import { chromium } from 'playwright-core';
 import http from 'node:http';
 import { readFile, stat, mkdir, mkdtemp, rm } from 'node:fs/promises';
@@ -207,19 +209,38 @@ if (process.env.MODEL) {
     assert.match(mv, /ready/, mv);
     assert.match(mv, where, mv);
     assert.doesNotMatch(mv, /not saved/, mv);
-    assert.match(await page.textContent('#foot-model'), /written by Gemma/);
+    assert.match(await page.textContent('#foot-model'), /chosen by Gemma/);
     summary.push(`Loaded in the browser in ${((Date.now() - t) / 1000).toFixed(0)} s: ${mv}`);
   });
 
   const writePlan = async (label) => {
+    // Every text the source line shows, from the click to the end.
+    await page.evaluate(() => {
+      window.sourceLog = [];
+      new MutationObserver(() => window.sourceLog.push(document.querySelector('#o-source').textContent))
+        .observe(document.querySelector('#o-source'), { childList: true, characterData: true, subtree: true });
+    });
+    const t = Date.now();
     await page.click('#btn-plan');
+    // The built-in choice shows at once, while the model ranks.
+    await waitText('#o-source', /ranking our lists|ranked our lists|failed/, 5000);
+    const firstShown = (Date.now() - t) / 1000;
+    assert.ok((await page.locator('#o-bring li').count()) > 0, 'the built-in Bring list shows while the model ranks');
     await waitText('#o-source', /ranked our lists|failed/, 10 * 60000);
     const source = await page.textContent('#o-source');
     const raw = await page.textContent('#o-raw');
+    const log = await page.evaluate(() => window.sourceLog);
+    const steps = log.filter((x) => /ranking our lists.*\d+\/\d+/.test(x));
+    // One <li> per item: the code's must-bring items, then the model's top three.
+    const items = await page.locator('#o-bring li').allTextContents();
+    const top3 = raw.split('Notice:')[0].split('\n').slice(1, 4).map((x) => x.replace(/^[+-]\d+\.\d+\s+/, '').trim());
     summary.push(`${label}: ${source}`, `  ranking:\n${raw.replace(/^/gm, '    ')}`,
-      `  bring: ${await page.textContent('#o-bring')}`, `  notice: ${await page.textContent('#o-notice')}`);
+      `  bring (${items.length} items): ${items.join(' · ')}`, `  notice: ${await page.textContent('#o-notice')}`,
+      `  built-in choice shown after ${firstShown.toFixed(1)} s; progress shown ${steps.length} times, last: ${steps.length ? steps.at(-1).replace(/^.*device: /, '') : 'none'}`);
     assert.match(source, /ranked our lists/, source);
     assert.match(raw, /Bring:[\s\S]*Notice:/, 'the ranking is shown');
+    assert.ok(steps.length > 0, 'progress is shown while ranking');
+    assert.deepEqual(items.slice(-3), top3, 'Bring ends with the model\'s top three, each its own item');
   };
 
   await step('real model: ranks the lists and chooses Bring and Notice', async () => {
@@ -240,6 +261,40 @@ if (process.env.MODEL) {
     await writePlan('Offline');
     await context.setOffline(false);
   });
+
+  if (process.env.BENCH_RUNS) {
+    await step('real model: each plan timed, the old way and the app\'s way', async () => {
+      // The app page's worker holds a copy of the model; free it first.
+      await page.goto('about:blank');
+      const bench = await context.newPage();
+      await bench.goto(`${base}bench.html?device=${device}&runs=${process.env.BENCH_RUNS}`);
+      await bench.waitForFunction(() => window.bench && window.bench.done, null, { timeout: 30 * 60000, polling: 1000 });
+      const result = await bench.evaluate(() => window.bench);
+      await bench.close();
+      assert.equal(result.error, undefined, result.error);
+      const way = { full: 'before: one full run per answer', shared: 'after: the app (shared prompt)' };
+      summary.push('', `Each plan timed in this browser (${process.env.BENCH_RUNS}; the first plan of each way also works out the no-plan scores):`);
+      for (const r of result.rows) {
+        summary.push(`  ${r.secs.toFixed(1).padStart(6)} s  ${way[r.mode] || r.mode}  ·  ${r.plan}  →  ${r.ranked.bring.slice(0, 3).map((x) => x.c).join(', ')} | ${r.ranked.notice[0].c}`);
+      }
+      // Where both ways ranked the same plan, the scores must match.
+      let maxDiff = null;
+      for (const a of result.rows.filter((r) => r.mode === 'full')) {
+        const b = result.rows.find((r) => r.mode === 'shared' && r.plan === a.plan);
+        if (!b) continue;
+        for (const list of ['bring', 'notice']) {
+          for (const x of a.ranked[list]) {
+            const d = Math.abs(x.score - b.ranked[list].find((y) => y.c === x.c).score);
+            maxDiff = Math.max(maxDiff ?? 0, d);
+          }
+        }
+      }
+      if (maxDiff !== null) {
+        summary.push(`  largest score difference between the two ways: ${maxDiff.toExponential(1)}`);
+        assert.ok(maxDiff <= 1e-3, `the two ways disagree by ${maxDiff}`);
+      }
+    });
+  }
 
   const title = device === 'webgpu' ? 'WebGPU (SwiftShader, a software GPU: slow, but the same code path)' : 'the CPU (WebAssembly)';
   const text = ['', `## Gemma in headless Chromium, on ${title}`, '', '```', ...summary, '```', ''].join('\n');

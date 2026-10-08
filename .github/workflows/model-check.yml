@@ -1,8 +1,10 @@
 name: Model check
 
-# Loads the real Gemma 3 270M IT (q4) with the app's own prompt builder and
-# never-guess check, and writes what it answered to the job summary: in Node,
-# then in headless Chromium on the CPU and on WebGPU, then again with no signal.
+# Loads the real Gemma 3 270M IT (q4) with the app's own ranking code and
+# lists, and writes what it chose and how long each plan took to the job
+# summary: in Node, then in headless Chromium on the CPU and on WebGPU, then
+# again with no signal. Each plan is timed the old way (one full model run per
+# answer) and the app's way (the prompt runs once and is reused).
 on:
   push:
     branches: [main]
@@ -18,6 +20,9 @@ on:
       - 'scripts/smoke.mjs'
       - 'scripts/build.mjs'
       - 'scripts/probe-ort.mjs'
+      - 'test/scenarios.mjs'
+      - 'scripts/bench-page.js'
+      - 'scripts/bench.html'
       - 'test/fixtures/ort/**'
       - 'package-lock.json'
       - '.github/workflows/model-check.yml'
@@ -34,6 +39,9 @@ on:
       - 'scripts/smoke.mjs'
       - 'scripts/build.mjs'
       - 'scripts/probe-ort.mjs'
+      - 'test/scenarios.mjs'
+      - 'scripts/bench-page.js'
+      - 'scripts/bench.html'
       - 'test/fixtures/ort/**'
       - 'package-lock.json'
       - '.github/workflows/model-check.yml'
@@ -49,7 +57,7 @@ concurrency:
 jobs:
   gemma:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -64,22 +72,26 @@ jobs:
           key: hf-gemma-3-270m-it-q4-v1
       - name: Gemma in Node (same ranking code as the app)
         run: npm run model-check
-      - name: Build the site
+      - name: Build the site, with the CI-only bench page
+        env:
+          BENCH: '1'
         run: npm run build
       - name: Install Chromium
         run: npx playwright-core install --with-deps chromium
       - name: Which runtime build runs the q4 operators (CPU and WebGPU)
         run: npm run probe-ort
       - name: Gemma in the browser on the CPU, then again with no signal
-        timeout-minutes: 15
+        timeout-minutes: 25
         env:
           MODEL: '1'
+          BENCH_RUNS: 'full:2,shared:6'
         run: npm run smoke
       - name: Gemma in the browser on WebGPU (software GPU), then again with no signal
-        timeout-minutes: 20
+        timeout-minutes: 40
         env:
           MODEL: '1'
           MODEL_DEVICE: webgpu
+          BENCH_RUNS: 'full:1,shared:2'
         run: npm run smoke
       - uses: actions/upload-artifact@v4
         if: always()
