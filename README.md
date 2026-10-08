@@ -56,7 +56,7 @@ The model chooses; code decides what it may choose from and works out every numb
 - **Measured in CI** (headless Chromium, 4-core GitHub runner), seconds to rank one plan, before and after in the same run:
   - Faster runner: 31.9 → 5.6 s and 32.2 → 5.6 s; the six test plans took 4.6–5.6 s.
   - Slower runner: 57.9 → 10.6 s and 59.3 → 10.7 s; the six plans took 9.2–10.7 s.
-  - On one thread (a browser that does not allow isolation): 17–20 s.
+  - On one thread (a browser that does not allow isolation): 9.4–10.5 s on the faster runner, 17.3–19.8 s on the slower one.
   - Real phones are not measured yet.
 - **WebGPU** reads the prompt once too, as its own call, because cutting a cache needs it in CPU memory. In CI, on a software GPU, one full run per answer disagreed with the CPU by up to 0.53; this way matches it to 0.001. The Model check fails if they drift apart.
 - **Two runtime builds, on purpose.** The q4 file uses a quantized operator (`GatherBlockQuantized`) that ONNX Runtime's WebGPU-capable build runs only on the GPU. So WebGPU devices use that build, and every other device uses the plain build, which runs it on the CPU. If WebGPU fails on a device, the app starts a fresh worker on the CPU and remembers that, with no second download.
