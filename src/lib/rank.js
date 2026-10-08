@@ -109,22 +109,36 @@ export async function rank(score, { question, neutral, answer }, candidates, bas
 }
 
 /**
- * The model as rankShared needs it: token ids in, logits for the last `keep`
- * positions out, optionally continuing from a cache of earlier positions
- * (Transformers.js past_key_values). The same in the browser worker and in Node.
+ * The model as rankShared needs it: rows of token ids in (all the same
+ * length), logits for the last `keep` positions of each row out, optionally
+ * continuing from a cache of earlier positions (Transformers.js
+ * past_key_values). The same in the browser worker and in Node.
  * @param {typeof import('@huggingface/transformers').Tensor} Tensor
  */
 export function makeLM(tokenizer, model, Tensor) {
   const int64 = (values, dims) => new Tensor('int64', BigInt64Array.from(values, BigInt), dims);
+  // A cache read once for one row, copied for every row of a batch.
+  const tile = (t, batch) => {
+    if (t.dims[0] === batch) return t;
+    if (t.location === 'gpu-buffer') throw new Error('a batched run needs its cache on the CPU');
+    const data = new t.data.constructor(t.data.length * batch);
+    for (let b = 0; b < batch; b += 1) data.set(t.data, b * t.data.length);
+    return new Tensor(t.type, data, [batch, ...t.dims.slice(1)]);
+  };
   return {
     encode: (text) => Array.from(tokenizer(text, { add_special_tokens: false }).input_ids.data, Number),
     prompt: (question) => tokenizer.apply_chat_template([{ role: 'user', content: question }], { tokenize: false, add_generation_prompt: true }),
-    async run(ids, cache, keep) {
-      const length = (cache ? cache.length : 0) + ids.length;
+    async run(rows, cache, keep) {
+      const batch = rows.length;
+      const width = rows[0].length;
+      const length = (cache ? cache.length : 0) + width;
+      const past = {};
+      if (cache) for (const [name, t] of Object.entries(cache.tensors)) past[name] = tile(t, batch);
       const out = await model({
-        input_ids: int64(ids, [1, ids.length]),
-        attention_mask: int64(new Array(length).fill(1), [1, length]),
-        ...(cache ? { past_key_values: cache.tensors } : {}),
+        input_ids: int64(rows.flat(), [batch, width]),
+        // All ones, even under padding: see scoreShared.
+        attention_mask: int64(new Array(batch * length).fill(1), [batch, length]),
+        ...(cache ? { past_key_values: past } : {}),
         // Only models exported with this input use it; others return every row.
         num_logits_to_keep: int64([keep], []),
       });
@@ -142,14 +156,26 @@ export function makeLM(tokenizer, model, Tensor) {
   };
 }
 
+// Each logits row is the whole vocabulary (262,144 floats, 1 MB), so a run
+// holds at most this many rows: about 64 MB, fine on a phone.
+const MAX_ROWS = 64;
+
 /**
  * Mean log-probability of each answer to one question. The prompt is the
- * same for every answer, so the model reads it once and keeps its cache;
- * each answer then costs only its own few tokens, with logits only where
- * they are read. Same scores as makeScorer, a fraction of the work.
+ * same for every answer, so the model reads it once and keeps its cache; the
+ * answers then run together, a few per model call. Same scores as makeScorer
+ * (one full run per answer) for a fraction of the work: in the browser's CPU
+ * build each call costs about a second whatever its length, so fewer calls is
+ * what counts.
+ *
+ * Answers of different lengths are padded at the end, and the attention mask
+ * stays all ones. This model works out positions and cache offsets from the
+ * mask (GroupQueryAttention), so masking the padding would shift them; and
+ * padding at the end needs no mask, because the model is causal: no real token
+ * ever sees a token after it.
  * @param {(n: number) => void} onScored called after each answer
  */
-export async function scoreShared(lm, question, answers, onScored = () => {}) {
+export async function scoreShared(lm, question, answers, onScored = () => {}, { maxRows = MAX_ROWS } = {}) {
   if (!answers.length) return [];
   const prompt = lm.prompt(question);
   const heads = new Map();
@@ -165,21 +191,38 @@ export async function scoreShared(lm, question, answers, onScored = () => {}) {
   // each answer's own run includes the row that predicts its first token.
   let shared = Math.min(...items.map((x) => x.from)) - 1;
   for (const x of items) shared = Math.min(shared, commonPrefixLength(items[0].ids, x.ids));
-  const head = shared >= 1 ? await lm.run(items[0].ids.slice(0, shared), null, 1) : null;
+  const head = shared >= 1 ? await lm.run([items[0].ids.slice(0, shared)], null, 1) : null;
+  const start = head ? shared : 0;
+  // Shortest first, so answers of similar length share a run and pad little.
+  const order = items.map((_, i) => i).sort((a, b) => items[a].ids.length - items[b].ids.length);
+  const chunks = [];
+  for (const i of order) {
+    const chunk = chunks.at(-1);
+    const width = items[i].ids.length - start;
+    if (chunk && (chunk.length + 1) * width <= maxRows) chunk.push(i);
+    else chunks.push([i]);
+  }
   try {
-    const scores = [];
-    for (const x of items) {
-      const start = head ? shared : 0;
-      // Rows from the one before the answer's first token to the end.
-      const keep = Math.min(x.ids.length - x.from + 1, x.ids.length - start);
-      const run = await lm.run(x.ids.slice(start), head && head.cache, keep);
+    const scores = new Array(items.length);
+    let done = 0;
+    for (const chunk of chunks) {
+      const width = Math.max(...chunk.map((i) => items[i].ids.length)) - start;
+      const rows = chunk.map((i) => {
+        const own = items[i].ids.slice(start);
+        return own.concat(new Array(width - own.length).fill(0));
+      });
+      const run = await lm.run(rows, head && head.cache, width);
       try {
-        const [, rows, vocab] = run.logits.dims;
-        scores.push(meanLogProbAt(run.logits.data, vocab, x.ids, x.from, x.ids.length - rows));
+        const [, kept, vocab] = run.logits.dims;
+        chunk.forEach((i, b) => {
+          const x = items[i];
+          const logits = run.logits.data.subarray(b * kept * vocab, (b + 1) * kept * vocab);
+          scores[i] = meanLogProbAt(logits, vocab, x.ids, x.from, start + width - kept);
+        });
       } finally {
         run.dispose();
       }
-      onScored(scores.length);
+      for (let k = 0; k < chunk.length; k += 1) onScored((done += 1));
     }
     return scores;
   } finally {

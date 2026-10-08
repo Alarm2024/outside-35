@@ -314,12 +314,13 @@ if (process.env.MODEL) {
         }
       }
       summary.push(`  largest score difference between runs of the same plan: ${maxDiff.toExponential(1)}`);
-      if (device === 'webgpu') {
-        // Not used by the app on WebGPU; shown so the difference can be studied.
-        for (const r of rows) summary.push(`  ${r.label}: ${['bring', 'notice'].map((l) => r.ranked[l].map((x) => `${x.score.toFixed(3)} ${x.c}`).join('; ')).join(' || ')}`);
-      } else {
-        assert.ok(maxDiff <= 1e-3, `runs of the same plan disagree by ${maxDiff}`);
-      }
+      // Every score for one plan both devices rank, so CPU and WebGPU can be compared.
+      const scores = (r) => ['bring', 'notice'].map((l) => r.ranked[l].map((x) => `${x.score.toFixed(3)} ${x.c}`).join('; ')).join(' || ');
+      const shown = device === 'webgpu' ? rows : rows.filter((r) => r.plan === 'a short walk').slice(0, 1);
+      for (const r of shown) summary.push(`  scores, ${r.plan}, ${r.label}: ${scores(r)}`);
+      // On WebGPU the app keeps one run per answer; the prompt-once run there is
+      // a study of why they differ, not something the app relies on.
+      if (device !== 'webgpu') assert.ok(maxDiff <= 1e-3, `runs of the same plan disagree by ${maxDiff}`);
     });
   }
 

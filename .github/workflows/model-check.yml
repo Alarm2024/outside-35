@@ -88,7 +88,7 @@ jobs:
         timeout-minutes: 25
         env:
           MODEL: '1'
-          BENCH_RUNS: '[{"label": "before: one full run per answer, 1 thread (main today)", "mode": "full", "n": 2, "threads": 1}, {"label": "after: the app (prompt read once, shipped no-plan scores)", "mode": "shared", "n": 6, "shipped": true}, {"label": "after, in a browser without isolation (1 thread)", "mode": "shared", "n": 6, "threads": 1, "shipped": true}, {"label": "check: prompt read once, no-plan scores worked out here", "mode": "shared", "n": 2}]'
+          BENCH_RUNS: '[{"label": "before: one full run per answer, 1 thread (main today)", "mode": "full", "n": 2, "threads": 1}, {"label": "after: the app (prompt read once, answers batched, shipped no-plan scores)", "mode": "shared", "n": 6, "shipped": true}, {"label": "after, in a browser without isolation (1 thread)", "mode": "shared", "n": 6, "threads": 1, "shipped": true}, {"label": "check: prompt read once, no-plan scores worked out here", "mode": "shared", "n": 2}]'
         run: npm run smoke
       - name: Gemma in the browser on WebGPU (software GPU), then again with no signal
         timeout-minutes: 50

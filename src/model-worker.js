@@ -93,11 +93,12 @@ async function load(id) {
  * Ranks this plan's Bring and Notice candidates, best first, reporting each
  * answer scored so the page can show progress.
  *
- * On the CPU each question's prompt runs once and its cache is reused
- * (rankShared): measured in CI, the same scores as one full run per answer.
+ * On the CPU each question's prompt runs once and its cache is reused, with
+ * the answers run together (rankShared): measured in CI, the same scores as
+ * one full run per answer.
  * On WebGPU that is not so (in CI, on a software GPU, scores differed by up
- * to 0.63), so WebGPU
- * keeps one full run per answer. mode overrides this, for the bench.
+ * to 0.63), so WebGPU keeps one full run per answer. mode overrides this, for
+ * the bench.
  */
 async function rankPlan({ id, plan, bring, notice, mode = device === 'wasm' ? 'shared' : 'full' }) {
   const q = rankingQuestions(plan);
