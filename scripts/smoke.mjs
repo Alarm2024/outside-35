@@ -302,14 +302,17 @@ if (process.env.MODEL) {
       }
       assert.equal(result.error, undefined, result.error);
       // Every pair of runs that ranked the same plan: how far apart are the scores?
-      const score = (r, list, c) => r.ranked[list].find((y) => y.c === c).score;
+      // A line's score does not depend on the other lines, so lines both runs ranked must match.
       let maxDiff = 0;
       const rows = result.rows;
       for (let i = 0; i < rows.length; i += 1) {
         for (let j = i + 1; j < rows.length; j += 1) {
           if (rows[i].plan !== rows[j].plan) continue;
           for (const list of ['bring', 'notice']) {
-            for (const x of rows[i].ranked[list]) maxDiff = Math.max(maxDiff, Math.abs(x.score - score(rows[j], list, x.c)));
+            for (const x of rows[i].ranked[list]) {
+              const y = rows[j].ranked[list].find((z) => z.c === x.c);
+              if (y) maxDiff = Math.max(maxDiff, Math.abs(x.score - y.score));
+            }
           }
         }
       }

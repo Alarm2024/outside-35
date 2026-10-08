@@ -1,7 +1,8 @@
 // Browser bench, built only for CI (BENCH=1 npm run build) and never deployed.
 // The app's own worker times each plan from test/scenarios.mjs. ?runs= is a
 // JSON list of runs: { label, mode: 'full' | 'shared', from = 0, n, threads
-// (default: as the app), shipped (start from the shipped no-plan scores) }.
+// (default: as the app), shipped (start from the shipped no-plan scores),
+// allNotices (every allowed Notice line, as before the cap of six) }.
 // Results go to window.bench.
 import { bringOptions, noticeOptions } from '../src/lib/plan.js';
 import { describePlan } from '../src/lib/rank.js';
@@ -51,7 +52,8 @@ try {
     for (const s of SCENARIOS.slice(from, from + run.n)) {
       const plan = scenarioPlan(s);
       const t = performance.now();
-      const { ranked } = await call({ type: 'rank', mode: run.mode, plan, bring: bringOptions(s.activity, plan.words).optional, notice: noticeOptions(plan) });
+      const notice = noticeOptions(plan, run.allNotices ? { max: Infinity } : {});
+      const { ranked } = await call({ type: 'rank', mode: run.mode, plan, bring: bringOptions(s.activity, plan.words).optional, notice });
       rows.push({ label: run.label, mode: run.mode, threads: threadsNow, plan: describePlan(plan), secs: (performance.now() - t) / 1000, ranked });
     }
   }

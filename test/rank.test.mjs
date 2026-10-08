@@ -63,36 +63,27 @@ function fakeLM({ keepSupported = true } = {}) {
     encode: (text) => (text.match(/\s?\S+|\s+$/g) || []).map(id),
     // Shaped like Gemma's chat template.
     prompt: (question) => `<bos><start_of_turn> user ${question} <end_of_turn> <start_of_turn> model\n`,
-    // Rows of the same length, each continuing from the cache (one row's, or one per row).
-    async run(rows, cache, keep) {
-      const width = rows[0].length;
-      assert.ok(rows.every((r) => r.length === width), 'every row the same length');
+    async run(ids, cache, keep) {
+      const all = [...(cache ? cache.ids : []), ...ids];
+      const first = all.length - (keepSupported ? keep : ids.length);
       const data = [];
-      let kept = 0;
-      const caches = [];
-      rows.forEach((ids, b) => {
-        const past = cache ? (cache.rows.length === 1 ? cache.rows[0] : cache.rows[b]) : [];
-        const all = [...past, ...ids];
-        const first = all.length - (keepSupported ? keep : ids.length);
-        for (let p = first; p < all.length; p += 1) data.push(...row(all.slice(0, p + 1)));
-        kept = all.length - first;
-        caches.push(all);
-      });
+      for (let p = first; p < all.length; p += 1) data.push(...row(all.slice(0, p + 1)));
       stats.runs += 1;
-      stats.tokens += rows.length * width;
-      stats.rows += rows.length * kept;
+      stats.tokens += ids.length;
+      stats.rows += all.length - first;
       stats.open += 1;
       return {
-        logits: { data: Float32Array.from(data), dims: [rows.length, kept, V] },
-        cache: { length: caches[0].length, rows: caches },
+        logits: { data: Float32Array.from(data), dims: [1, all.length - first, V] },
+        cache: { length: all.length, ids: all },
         dispose: () => { stats.open -= 1; },
       };
     },
+    prefix: (cache, n) => ({ length: n, ids: cache.ids.slice(0, n) }),
     // The old way: the whole sequence, every row.
     async full(question, { prefix, text }) {
       const head = lm.encode(lm.prompt(question) + prefix);
       const all = lm.encode(lm.prompt(question) + prefix + text);
-      const r = await lm.run([all], null, all.length);
+      const r = await lm.run(all, null, all.length);
       r.dispose();
       return meanLogProb(r.logits.data, V, all, commonPrefixLength(head, all));
     },
@@ -129,31 +120,17 @@ for (const keepSupported of [true, false]) {
       const got = await scoreShared(lm, question, answers);
       assert.deepEqual(got, expected);
       assert.ok(got.every(Number.isFinite));
-      assert.equal(lm.stats.runs, 2, 'the prompt once, then all the answers in one run');
-      // The prompt once, then each answer's own tokens, padded to the longest (plus one where a space merged).
+      assert.equal(lm.stats.runs, answers.length, 'one run per answer: the prompt is read in the first one');
+      // The prompt once (inside the first, shortest answer), then each answer's own tokens (plus one where a space merged).
       const promptTokens = lm.encode(lm.prompt(question)).length;
       const own = answers.map((a) => lm.encode(lm.prompt(question) + a.prefix + a.text).length - promptTokens + 1);
-      assert.ok(lm.stats.tokens <= promptTokens + answers.length * Math.max(...own), `${lm.stats.tokens} tokens vs ${full.tokens}`);
+      assert.ok(lm.stats.tokens <= promptTokens + own.reduce((x, y) => x + y, 0), `${lm.stats.tokens} tokens vs ${full.tokens}`);
       assert.ok(lm.stats.tokens < full.tokens, `${lm.stats.tokens} tokens vs ${full.tokens}`);
       if (keepSupported) assert.ok(lm.stats.rows < full.rows / 3, `${lm.stats.rows} logits rows vs ${full.rows}`);
       assert.equal(lm.stats.open, 0, 'every cache is released (GPU memory on WebGPU)');
     }
   });
 }
-
-test('answers split into several runs when they would hold too many rows, with the same scores', async () => {
-  const lm = fakeLM();
-  const question = 'I am going out for a short walk. What is one small thing I could notice outside?';
-  const answers = [...NOTICES, { prefix: '', text: 'Look up.' }];
-  const expected = [];
-  for (const a of answers) expected.push(await lm.full(question, a));
-  lm.stats.runs = 0;
-  const steps = [];
-  assert.deepEqual(await scoreShared(lm, question, answers, (n) => steps.push(n), { maxRows: 1 }), expected);
-  assert.equal(lm.stats.runs, 1 + answers.length, 'one answer per run when a run may hold one row');
-  assert.deepEqual(steps, [1, 2, 3], 'progress counts every answer');
-  assert.equal(lm.stats.open, 0);
-});
 
 test('the answer\'s first token is scored even when the space before it merges into it', async () => {
   const lm = fakeLM();
