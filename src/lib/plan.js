@@ -126,17 +126,26 @@ const NOTICES = [
   { text: 'Notice where the path bends next, and what is just out of sight.', activity: ['walk', 'hike'] },
 ];
 
-/** The Notice lines this plan's data allows. Weather lines need weather data. */
-export function noticeOptions({ activity, words, seasonName, part }) {
+// At most this many Notice lines go to the model, because each one is one
+// more model run (about 0.7 s on a 4-core CPU in CI).
+const MAX_NOTICES = 6;
+
+/**
+ * The Notice lines this plan's data allows, at most MAX_NOTICES. Weather lines
+ * need weather data. Lines tied to this plan's data come first; lines that
+ * suit any plan fill the rest.
+ */
+export function noticeOptions({ activity, words, seasonName, part }, { max = MAX_NOTICES } = {}) {
   const has = (want, value) => !want || (value != null && want.includes(value));
-  return NOTICES.filter((n) => has(n.activity, activity)
+  const allowed = NOTICES.filter((n) => has(n.activity, activity)
     && has(n.season, seasonName)
     && has(n.part, part)
     && has(n.temp, words && words.temp)
     && has(n.rain, words && words.rain)
     && has(n.wind, words && words.wind)
-    && has(n.sun, words && words.sun))
-    .map((n) => n.text);
+    && has(n.sun, words && words.sun));
+  const tied = (n) => Boolean(n.activity || n.season || n.part || n.temp || n.rain || n.wind || n.sun);
+  return [...allowed.filter(tied), ...allowed.filter((n) => !tied(n))].slice(0, max).map((n) => n.text);
 }
 
 /** Every line any plan can rank, once each (for the model check). */

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { commonPrefixLength, describePlan, meanLogProb, meanLogProbAt, rank, rankingQuestions, rankShared, rankSteps, scoreShared } from '../src/lib/rank.js';
+import { commonPrefixLength, describePlan, meanLogProb, meanLogProbAt, rank, rankingQuestions, rankShared, rankSteps, runInPieces, scoreShared } from '../src/lib/rank.js';
 import { conditionWords } from '../src/lib/plan.js';
 
 test('mean log-probability reads the row before each token', () => {
@@ -57,7 +57,7 @@ function fakeLM({ keepSupported = true } = {}) {
     for (const x of prefix) h = (h * 31 + x + 1) % 1000003;
     return Array.from({ length: V }, (_, j) => Math.sin(h * (j + 1)) * 3);
   };
-  const stats = { runs: 0, tokens: 0, rows: 0, open: 0 };
+  const stats = { runs: 0, tokens: 0, rows: 0, open: 0, calls: [] };
   const lm = {
     stats,
     encode: (text) => (text.match(/\s?\S+|\s+$/g) || []).map(id),
@@ -69,6 +69,7 @@ function fakeLM({ keepSupported = true } = {}) {
       const data = [];
       for (let p = first; p < all.length; p += 1) data.push(...row(all.slice(0, p + 1)));
       stats.runs += 1;
+      stats.calls.push({ tokens: ids.length, keep });
       stats.tokens += ids.length;
       stats.rows += all.length - first;
       stats.open += 1;
@@ -78,6 +79,7 @@ function fakeLM({ keepSupported = true } = {}) {
         dispose: () => { stats.open -= 1; },
       };
     },
+    prefix: (cache, n) => ({ length: n, ids: cache.ids.slice(0, n) }),
     // The old way: the whole sequence, every row.
     async full(question, { prefix, text }) {
       const head = lm.encode(lm.prompt(question) + prefix);
@@ -119,17 +121,30 @@ for (const keepSupported of [true, false]) {
       const got = await scoreShared(lm, question, answers);
       assert.deepEqual(got, expected);
       assert.ok(got.every(Number.isFinite));
-      assert.equal(lm.stats.runs, answers.length + 1, 'the prompt once, then each answer');
-      // The prompt once, then each answer's own tokens (plus one where a space merged).
+      assert.equal(lm.stats.runs, answers.length, 'one run per answer: the prompt is read in the first one');
+      // The prompt once (inside the first, shortest answer), then each answer's own tokens (plus one where a space merged).
       const promptTokens = lm.encode(lm.prompt(question)).length;
       const own = answers.map((a) => lm.encode(lm.prompt(question) + a.prefix + a.text).length - promptTokens + 1);
       assert.ok(lm.stats.tokens <= promptTokens + own.reduce((x, y) => x + y, 0), `${lm.stats.tokens} tokens vs ${full.tokens}`);
       assert.ok(lm.stats.tokens < full.tokens, `${lm.stats.tokens} tokens vs ${full.tokens}`);
-      if (keepSupported) assert.ok(lm.stats.rows < full.rows / 4, `${lm.stats.rows} logits rows vs ${full.rows}`);
+      if (keepSupported) assert.ok(lm.stats.rows < full.rows / 3, `${lm.stats.rows} logits rows vs ${full.rows}`);
       assert.equal(lm.stats.open, 0, 'every cache is released (GPU memory on WebGPU)');
     }
   });
 }
+
+test('with the prompt run on its own (WebGPU), the same scores, one run more', async () => {
+  const lm = fakeLM();
+  const question = 'I am going out for a hike on a cold, rain likely day in the morning in winter. What is one small thing I could notice outside?';
+  const expected = [];
+  for (const a of NOTICES) expected.push(await lm.full(question, a));
+  lm.stats.runs = 0;
+  const steps = [];
+  assert.deepEqual(await scoreShared(lm, question, NOTICES, (n) => steps.push(n), { promptInFirstAnswer: false }), expected);
+  assert.equal(lm.stats.runs, NOTICES.length + 1);
+  assert.deepEqual(steps, [1, 2]);
+  assert.equal(lm.stats.open, 0, 'the prompt\'s cache is released too');
+});
 
 test('the answer\'s first token is scored even when the space before it merges into it', async () => {
   const lm = fakeLM();
@@ -157,4 +172,47 @@ test('rankShared ranks like rank, reuses the no-plan scores, and reports every s
   const again = [];
   await rankShared(lm, q, items, baselines, (n) => again.push(n));
   assert.equal(again.length, 3);
+});
+
+test('a long run read in pieces gives the same rows, and releases each piece', async () => {
+  const lm = fakeLM();
+  const ids = lm.encode(lm.prompt('I am going out for a hike on a cold, rain likely day in the morning in winter. What is the most useful thing to bring?') + 'Bring a first aid kit.');
+  const whole = await lm.run(ids, null, 3);
+  whole.dispose();
+  for (const max of [4, 7, 16, ids.length - 1]) {
+    lm.stats.calls = [];
+    const pieces = await runInPieces(lm, ids, null, 3, max);
+    assert.deepEqual(Array.from(pieces.logits.data), Array.from(whole.logits.data), `max ${max}`);
+    assert.equal(pieces.cache.length, ids.length);
+    assert.ok(lm.stats.calls.length > 1);
+    assert.ok(lm.stats.calls.every((c) => c.tokens <= max), JSON.stringify(lm.stats.calls));
+    pieces.dispose();
+    assert.equal(lm.stats.open, 0, 'every piece is released');
+  }
+  // More rows to keep than one piece holds: the last piece is long enough for them.
+  lm.stats.calls = [];
+  const wide = await runInPieces(lm, ids, null, 9, 4);
+  assert.equal(wide.logits.dims[1], 9);
+  assert.equal(lm.stats.calls.at(-1).tokens, 9);
+  assert.ok(lm.stats.calls.slice(0, -1).every((c) => c.tokens <= 4));
+  wide.dispose();
+  // Short enough: one call, as before.
+  lm.stats.calls = [];
+  (await runInPieces(lm, ids.slice(0, 5), null, 1, 16)).dispose();
+  assert.deepEqual(lm.stats.calls, [{ tokens: 5, keep: 1 }]);
+});
+
+test('with a cap on new tokens per call (WebGPU), the same scores, and no call over the cap', async () => {
+  const question = 'I am going out for a short walk on a cool, dry day in the afternoon in autumn. What is one small thing I could notice outside?';
+  for (const promptInFirstAnswer of [false, true]) {
+    const lm = fakeLM();
+    const expected = [];
+    for (const a of NOTICES) expected.push(await lm.full(question, a));
+    lm.stats.calls = [];
+    const got = await scoreShared(lm, question, NOTICES, () => {}, { promptInFirstAnswer, maxRun: 6 });
+    assert.deepEqual(got, expected, `promptInFirstAnswer ${promptInFirstAnswer}`);
+    // A call is longer than the cap only when the rows it must return need it.
+    assert.ok(lm.stats.calls.every((c) => c.tokens <= Math.max(6, c.keep)), JSON.stringify(lm.stats.calls));
+    assert.equal(lm.stats.open, 0);
+  }
 });

@@ -29,6 +29,18 @@ test('Notice lines that need weather only appear with weather data', () => {
   for (const n of [...none, ...wet, ...dry]) assert.doesNotMatch(n, /[0-9]/);
 });
 
+test('at most six Notice lines go to the model, the ones tied to this plan first', () => {
+  const wet = noticeOptions({ activity: 'hike', words: conditionWords(F(3, 8, 70, 1, 35)), seasonName: 'winter', part: 'morning' });
+  assert.equal(wet.length, 6);
+  assert.ok(!wet.includes('Listen for the quietest sound around you.'), 'a line for any plan gives way to one about this plan');
+  const dry = noticeOptions({ activity: 'walk', words: conditionWords(F(14, 17, 10, 2, 12)), seasonName: 'autumn', part: 'afternoon' });
+  assert.deepEqual(dry.slice(0, 3), ['Look for the first leaves changing colour.', 'Watch the light change as the sun gets lower.', 'Notice where the path bends next, and what is just out of sight.']);
+  assert.equal(dry.length, 6);
+  const none = noticeOptions({ activity: 'garden', words: null, seasonName: 'unknown', part: 'unknown' });
+  assert.equal(none[0], 'Touch the soil and notice whether it is dry or damp.');
+  assert.ok(none.length <= 6);
+});
+
 test('fallback choice is deterministic and admits what it does not know', () => {
   assert.deepEqual(fallbackBring('walk', null), ['a light layer (weather unknown)', 'water', 'comfortable shoes', 'a snack']);
   assert.ok(fallbackBring('hike', { temp: 'cold', rain: 'rain likely', sun: 'weak sun', wind: 'calm' }).includes('a rain jacket (rain likely)'));

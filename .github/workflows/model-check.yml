@@ -88,14 +88,14 @@ jobs:
         timeout-minutes: 25
         env:
           MODEL: '1'
-          BENCH_RUNS: '[{"label": "before: one full run per answer, 1 thread (main today)", "mode": "full", "n": 2, "threads": 1}, {"label": "after: the app (prompt read once, shipped no-plan scores)", "mode": "shared", "n": 6, "shipped": true}, {"label": "after, in a browser without isolation (1 thread)", "mode": "shared", "n": 6, "threads": 1, "shipped": true}, {"label": "check: prompt read once, no-plan scores worked out here", "mode": "shared", "n": 2}]'
+          BENCH_RUNS: '[{"label": "before: one full run per answer, 1 thread, every Notice line (main before #2)", "mode": "full", "n": 2, "threads": 1, "allNotices": true}, {"label": "after: the app (prompt read once, at most 6 Notice lines, shipped no-plan scores)", "mode": "shared", "n": 6, "shipped": true, "timings": true}, {"label": "after, in a browser without isolation (1 thread)", "mode": "shared", "n": 6, "threads": 1, "shipped": true}, {"label": "what if: at most 5 Notice and 5 Bring lines", "mode": "shared", "n": 6, "shipped": true, "notices": 5, "bring": 5}, {"label": "check: prompt read once, no-plan scores worked out here", "mode": "shared", "n": 2}]'
         run: npm run smoke
       - name: Gemma in the browser on WebGPU (software GPU), then again with no signal
         timeout-minutes: 50
         env:
           MODEL: '1'
           MODEL_DEVICE: webgpu
-          BENCH_RUNS: '[{"label": "the app on WebGPU (one full run per answer, as before)", "mode": "full", "from": 3, "n": 1}, {"label": "study: prompt read once on WebGPU (not used by the app)", "mode": "shared", "from": 3, "n": 1}]'
+          BENCH_RUNS: '[{"label": "before: one full run per answer (main)", "mode": "full", "from": 3, "n": 1}, {"label": "after: the app on WebGPU (prompt read once, on its own, at most 16 new tokens per call)", "mode": "shared", "from": 3, "n": 1, "timings": true}, {"label": "after: the app on WebGPU, a long prompt (read in pieces)", "mode": "shared", "from": 0, "n": 1, "shipped": true, "timings": true}]'
         run: npm run smoke
       - uses: actions/upload-artifact@v4
         if: always()
@@ -103,5 +103,6 @@ jobs:
           name: model-check
           path: |
             model-check.md
+            model-check-scores.json
             docs/screenshot-model-*.png
           if-no-files-found: ignore
